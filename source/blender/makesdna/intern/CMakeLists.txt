@@ -89,6 +89,7 @@ endif()
 add_c_and_cxx_flags_custom_test(makesdna)
 
 add_executable(makesdna ${SRC} ${SRC_DNA_INC})
+blender_wasm_host_tool(makesdna)  # WASM: run via node at build time
 setup_platform_linker_flags(makesdna)
 setup_platform_linker_libs(makesdna)
 blender_target_include_dirs(makesdna ${INC})

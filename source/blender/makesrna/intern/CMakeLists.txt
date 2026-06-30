@@ -403,6 +403,7 @@ endif()
 add_c_and_cxx_flags_custom_test(makesrna)
 
 add_executable(makesrna ${SRC} ${SRC_RNA_INC} ${SRC_DNA_INC})
+blender_wasm_host_tool(makesrna)  # WASM: run via node at build time
 setup_platform_linker_flags(makesrna)
 setup_platform_linker_libs(makesrna)
 blender_target_include_dirs(makesrna ${INC})

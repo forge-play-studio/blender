@@ -49,4 +49,5 @@ endif()
 
 # `SRC_DNA_INC` is defined in the parent directory.
 add_executable(shader_tool ${SRC})
+blender_wasm_host_tool_native(shader_tool "${CMAKE_SOURCE_DIR}/../wasm-sysroot/bin/shader_tool")  # WASM: native binary
 optimize_debug_target(shader_tool)

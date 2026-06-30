@@ -100,6 +100,10 @@ struct TypeInfo {
   /* Alignment requirements for 32 and 64 bit platforms. */
   short align_32;
   short align_64;
+  /* Native alignment for the platform makesdna itself runs on. Tracked so that
+   * size_native/offsets account for ABIs (e.g. wasm32: 4-byte pointers but
+   * 8-byte-aligned int64/double) that the 32/64 hand-padding doesn't cover. */
+  short align_native;
   /* Struct or built-in type? */
   bool is_struct;
 };
@@ -127,6 +131,7 @@ struct TypeTable {
                          .size_64 = size,
                          .align_32 = size,
                          .align_64 = size,
+                         .align_native = size,
                          .is_struct = false});
   }
 
@@ -139,6 +144,7 @@ struct TypeTable {
                      .size_64 = 0,
                      .align_32 = 0,
                      .align_64 = 0,
+                     .align_native = 0,
                      .is_struct = true});
   }
 
@@ -229,6 +235,23 @@ static int member_size_native(const TypeInfo &member_type, const dna::ParsedMemb
   return member_type.size_native * array_num;
 }
 
+/** Native alignment a member requires on the platform makesdna runs on. */
+static int member_align_native(const TypeInfo &member_type,
+                               const dna::ParsedMember &parsed_member)
+{
+  const char *cp = parsed_member.member_name.c_str();
+  /* Pointers align to the native pointer size (4 on wasm32, 8 on LP64). */
+  int a = (cp[0] == '*' || cp[1] == '*') ? int(sizeof(void *)) : int(member_type.align_native);
+  a = std::max(a, parsed_member.alignment); /* C++ alignas() override. */
+  return a > 0 ? a : 1;
+}
+
+/** Round `offset` up to a multiple of alignment `a`. */
+static int align_up_native(int offset, int a)
+{
+  return (a > 1) ? ((offset + a - 1) / a) * a : offset;
+}
+
 static bool check_member_alignment(const TypeInfo &struct_info,
                                    const TypeInfo &member_type,
                                    const int len,
@@ -302,6 +325,7 @@ static int compute_type_size_and_alignment(TypeTable &table,
         /* Sizes of the largest field in a struct. */
         int max_align_32 = 0;
         int max_align_64 = 0;
+        int max_align_native = 0;
 
         /* check all members in struct */
         for (const dna::ParsedMember &parsed_member : parsed_struct.members) {
@@ -351,6 +375,10 @@ static int compute_type_size_and_alignment(TypeTable &table,
               dna_error = true;
             }
 
+            size_native = align_up_native(
+                size_native, member_align_native(member_type, parsed_member));
+            max_align_native = std::max(
+                max_align_native, member_align_native(member_type, parsed_member));
             size_native += member_size_native(member_type, parsed_member);
             size_32 += 4 * array_num;
             size_64 += 8 * array_num;
@@ -410,6 +438,10 @@ static int compute_type_size_and_alignment(TypeTable &table,
               dna_error = true;
             }
 
+            size_native = align_up_native(
+                size_native, member_align_native(member_type, parsed_member));
+            max_align_native = std::max(
+                max_align_native, member_align_native(member_type, parsed_member));
             size_native += member_size_native(member_type, parsed_member);
             size_32 += array_num * member_type.size_32;
             size_64 += array_num * member_type.size_64;
@@ -435,11 +467,16 @@ static int compute_type_size_and_alignment(TypeTable &table,
           BLI_assert(size_32 <= SHRT_MAX);
           BLI_assert(size_64 <= SHRT_MAX);
 
+          /* Pad the struct tail to its own alignment, matching the C compiler
+           * (no-op when the struct is already naturally/hand-padded). */
+          size_native = align_up_native(size_native, max_align_native);
+
           struct_info.size_native = short(size_native);
           struct_info.size_32 = short(size_32);
           struct_info.size_64 = short(size_64);
           struct_info.align_32 = short(max_align_32);
           struct_info.align_64 = short(max_align_64);
+          struct_info.align_native = short(max_align_native);
 
           /* Sanity check 1: alignment should never be 0. */
           BLI_assert(max_align_32);
@@ -782,6 +819,8 @@ static void write_sdna_verify(FILE *file,
     for (const dna::ParsedMember &parsed_member : parsed_struct.members) {
       const TypeInfo &member_type = table.lookup(parsed_member.type_name);
       const StringRef alias_id = DNA_member_id_string_ref(parsed_member.alias_member_name);
+      /* Match the native ABI alignment used when computing sizes/offsets. */
+      offset = align_up_native(offset, member_align_native(member_type, parsed_member));
       fprintf(file,
               "BLI_STATIC_ASSERT(offsetof(struct %s, %.*s) == %d, \"DNA member offset "
               "verify\");\n",

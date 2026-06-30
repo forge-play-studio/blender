@@ -232,18 +232,48 @@ struct GPUSource {
       /* Save for hash collision comparison. */
       fmt.format_str = format;
 
-      /* Escape characters replacement. Do the most common ones. */
-      format = std::regex_replace(format, std::regex(R"(\\n)"), "\n");
-      format = std::regex_replace(format, std::regex(R"(\\v)"), "\v");
-      format = std::regex_replace(format, std::regex(R"(\\t)"), "\t");
-      format = std::regex_replace(format, std::regex(R"(\\')"), "\'");
-      format = std::regex_replace(format, std::regex(R"(\\")"), "\"");
-      format = std::regex_replace(format, std::regex(R"(\\\\)"), "\\");
+      /* Escape characters replacement. Do the most common ones.
+       * NOTE: done with a manual single pass rather than std::regex — libc++'s
+       * std::regex is pathologically slow/hangs under Emscripten/wasm (this was
+       * the first call site reached during GPU init and it stalled the whole
+       * boot). A linear unescape is equivalent for these simple sequences. */
+      {
+        std::string unescaped;
+        unescaped.reserve(format.size());
+        for (size_t i = 0; i < format.size(); i++) {
+          if (format[i] == '\\' && i + 1 < format.size()) {
+            const char n = format[i + 1];
+            char repl = 0;
+            switch (n) {
+              case 'n': repl = '\n'; break;
+              case 'v': repl = '\v'; break;
+              case 't': repl = '\t'; break;
+              case '\'': repl = '\''; break;
+              case '"': repl = '"'; break;
+              case '\\': repl = '\\'; break;
+              default: break;
+            }
+            if (repl != 0) {
+              unescaped.push_back(repl);
+              i++;
+              continue;
+            }
+          }
+          unescaped.push_back(format[i]);
+        }
+        format = std::move(unescaped);
+      }
 
       shader::PrintfFormat::Block::ArgumentType type =
           shader::PrintfFormat::Block::ArgumentType::NONE;
-      int64_t start = 0, end = 0, cursor = -1;
-      while ((end = format.find_first_of('%', cursor + 1)) != -1) {
+      /* NOTE: compare the find result against std::string::npos, NOT -1. On
+       * wasm32 size_t is 32-bit, so npos (0xFFFFFFFF) widened into an int64_t is
+       * 4294967295, never -1 -> the old `!= -1` test looped forever. */
+      int64_t start = 0;
+      int64_t cursor = -1;
+      size_t found;
+      while ((found = format.find_first_of('%', size_t(cursor + 1))) != std::string::npos) {
+        const int64_t end = int64_t(found);
         if (end - start > 0) {
           /* Add the previous block without the newly found % character. */
           fmt.format_blocks.append({type, format.substr(start, end - start)});

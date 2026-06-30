@@ -142,6 +142,9 @@ double BLI_dir_free_space(const char *dir)
   GetDiskFreeSpace(tmp, &sectorspc, &bytesps, &freec, &clusters);
 
   return double(freec * bytesps * sectorspc);
+#elif defined(__EMSCRIPTEN__)
+  (void)dir;
+  return -1; /* WASM: no real filesystem free-space query. */
 #else
 
 #  ifdef USE_STATFS_STATVFS

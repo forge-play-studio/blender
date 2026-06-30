@@ -1699,3 +1699,30 @@ macro(optimize_debug_target executable)
     endif()
   endif()
 endmacro()
+
+# WASM_PATCH_HOST_TOOL: build-time codegen tools (makesdna/makesrna/datatoc) are
+# cross-compiled to wasm but must run on the host. Run them via node with real
+# filesystem access and a node shebang so $<TARGET_FILE:tool> invocations work.
+function(blender_wasm_host_tool target)
+  if(NOT EMSCRIPTEN)
+    return()
+  endif()
+  target_link_options(${target} PRIVATE
+    "-sNODERAWFS=1" "-sENVIRONMENT=node,worker" "-sEXIT_RUNTIME=1" "-sALLOW_MEMORY_GROWTH=1")
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} "-DTOOL_JS=$<TARGET_FILE:${target}>"
+            -P "${CMAKE_SOURCE_DIR}/build_files/cmake/wasm_host_tool_shebang.cmake"
+    VERBATIM)
+endfunction()
+
+# WASM_PATCH_HOST_TOOL_NATIVE: for self-contained host tools (e.g. shader_tool)
+# that build cleanly on the host but misbehave as wasm, overwrite the wasm tool
+# output with a prebuilt native binary so $<TARGET_FILE:tool> runs natively.
+function(blender_wasm_host_tool_native target native_path)
+  if(NOT EMSCRIPTEN)
+    return()
+  endif()
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy "${native_path}" "$<TARGET_FILE:${target}>"
+    VERBATIM)
+endfunction()

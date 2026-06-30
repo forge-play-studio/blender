@@ -945,6 +945,14 @@ else()
   mark_as_advanced(WITH_VULKAN_BACKEND)
 endif()
 
+# WebGPU (Emscripten / Dawn) — browser graphics backend for the WASM port.
+if(EMSCRIPTEN)
+  option(WITH_WEBGPU_BACKEND "Enable WebGPU as graphics backend (WASM/browser)" OFF)
+else()
+  set(WITH_WEBGPU_BACKEND OFF)
+endif()
+mark_as_advanced(WITH_WEBGPU_BACKEND)
+
 # Metal
 if(APPLE)
   option(WITH_METAL_BACKEND "\
@@ -2439,6 +2447,7 @@ if(WITH_BLENDER)
   add_subdirectory(source)
 elseif(WITH_CYCLES_STANDALONE OR WITH_CYCLES_HYDRA_RENDER_DELEGATE)
   add_subdirectory(intern/atomic)
+  add_subdirectory(intern/profile)  # WASM_PATCH_PROFILE: guardedalloc needs it
   add_subdirectory(intern/guardedalloc)
   add_subdirectory(intern/libc_compat)
   add_subdirectory(intern/sky)

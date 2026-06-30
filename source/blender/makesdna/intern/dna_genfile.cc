@@ -296,6 +296,50 @@ int DNA_struct_find_index_without_alias(const SDNA *sdna, const char *str)
   return DNA_struct_find_index_without_alias_ex(sdna, str, &index_last_dummy);
 }
 
+/* --- Mixed-ABI struct member alignment (e.g. wasm32) ---------------------- *
+ * DNA structs are hand-padded so they have no implicit padding -- but that
+ * guarantee only holds on ABIs where the pointer size equals the maximum
+ * scalar alignment (LP64: 8/8, conventional ILP32: 4/4). wasm32 is the
+ * exception: 4-byte pointers, yet int64_t/double still align to 8, so the
+ * compiler inserts padding that the packed SDNA offset arithmetic below would
+ * otherwise miss. These helpers mirror makesdna's `align_native` model so that
+ * runtime member offsets (reconstruct steps, pointer gathering) match the
+ * compiler's actual struct layout. On conventional ABIs they are no-ops
+ * (packed == aligned), so this is safe on all platforms. */
+static int sdna_type_alignment(const SDNA *sdna, int type_index);
+
+static int sdna_member_alignment(const SDNA *sdna, const SDNA_StructMember *member)
+{
+  if (ispointer(sdna->members[member->member_index])) {
+    return sdna->pointer_size;
+  }
+  return sdna_type_alignment(sdna, member->type_index);
+}
+
+static int sdna_type_alignment(const SDNA *sdna, int type_index)
+{
+  const int struct_index = DNA_struct_find_index_without_alias(sdna, sdna->types[type_index]);
+  if (struct_index == -1) {
+    /* Built-in scalar: natural alignment equals its size (all are <= 8). */
+    const int s = sdna->types_size[type_index];
+    return (s > 8) ? 8 : (s > 0 ? s : 1);
+  }
+  const SDNA_Struct *st = sdna->structs[struct_index];
+  int align = 1;
+  for (int i = 0; i < st->members_num; i++) {
+    const int a = sdna_member_alignment(sdna, &st->members[i]);
+    if (a > align) {
+      align = a;
+    }
+  }
+  return align;
+}
+
+static int sdna_align_up(int offset, int align)
+{
+  return (align > 1) ? ((offset + align - 1) / align) * align : offset;
+}
+
 int DNA_struct_find_with_alias(const SDNA *sdna, const char *str)
 {
   uint index_last_dummy = UINT_MAX;
@@ -1027,6 +1071,7 @@ static int elem_offset_impl(const SDNA *sdna,
     const SDNA_StructMember *member = &old->members[a];
     const char *otype = types[member->type_index];
     const char *oname = names[member->member_index];
+    offset = sdna_align_up(offset, sdna_member_alignment(sdna, member));
     if (elem_streq(name, oname)) { /* name equal */
       if (STREQ(type, otype)) {    /* type equal */
         return offset;
@@ -1285,6 +1330,7 @@ static const SDNA_StructMember *find_member_with_matching_name(const SDNA *sdna,
   for (int a = 0; a < struct_info->members_num; a++) {
     const SDNA_StructMember *member = &struct_info->members[a];
     const char *member_name = sdna->members[member->member_index];
+    offset = sdna_align_up(offset, sdna_member_alignment(sdna, member));
     if (elem_streq(name, member_name)) {
       *r_offset = offset;
       return member;
@@ -1497,6 +1543,8 @@ static ReconstructStep *create_reconstruct_steps_for_struct(const SDNA *oldsdna,
   int new_member_offset = 0;
   for (int new_member_index = 0; new_member_index < new_struct->members_num; new_member_index++) {
     const SDNA_StructMember *new_member = &new_struct->members[new_member_index];
+    new_member_offset = sdna_align_up(new_member_offset,
+                                      sdna_member_alignment(newsdna, new_member));
     init_reconstruct_step_for_member(oldsdna,
                                      newsdna,
                                      compare_flags,
@@ -1986,9 +2034,13 @@ PointersInDNA::PointersInDNA(const SDNA &sdna) : sdna_(sdna)
 
     struct_info.size_in_bytes = 0;
     for (const int member_i : IndexRange(sdna_struct.members_num)) {
-      struct_info.size_in_bytes += get_member_size_in_bytes(&sdna_,
-                                                            &sdna_struct.members[member_i]);
+      const SDNA_StructMember &member = sdna_struct.members[member_i];
+      struct_info.size_in_bytes = sdna_align_up(struct_info.size_in_bytes,
+                                                sdna_member_alignment(&sdna_, &member));
+      struct_info.size_in_bytes += get_member_size_in_bytes(&sdna_, &member);
     }
+    struct_info.size_in_bytes = sdna_align_up(
+        struct_info.size_in_bytes, sdna_type_alignment(&sdna_, sdna_struct.type_index));
 
     this->gather_pointer_members_recursive(sdna_struct, 0, structs_[struct_i]);
   }
@@ -2004,6 +2056,8 @@ void PointersInDNA::gather_pointer_members_recursive(const SDNA_Struct &sdna_str
     const char *member_type_name = sdna_.types[member.type_index];
     const eStructMemberCategory member_category = get_struct_member_category(&sdna_, &member);
     const int array_elem_num = sdna_.members_array_num[member.member_index];
+
+    offset = sdna_align_up(offset, sdna_member_alignment(&sdna_, &member));
 
     if (member_category == STRUCT_MEMBER_CATEGORY_POINTER) {
       for (int elem_i = 0; elem_i < array_elem_num; elem_i++) {

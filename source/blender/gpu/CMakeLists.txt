@@ -9,6 +9,7 @@ set(INC
   metal
   opengl
   vulkan
+  webgpu
   ../makesrna
 
   # For theme color access.
@@ -473,6 +474,48 @@ if(WITH_VULKAN_BACKEND)
   add_definitions(-DWITH_VULKAN_BACKEND)
 endif()
 
+if(WITH_WEBGPU_BACKEND)
+  list(APPEND SRC
+    webgpu/webgpu_batch.cc
+    webgpu/webgpu_context.cc
+    webgpu/webgpu_framebuffer.cc
+    webgpu/webgpu_index_buffer.cc
+    webgpu/webgpu_shader.cc
+    webgpu/webgpu_shader_interface.cc
+    webgpu/webgpu_state.cc
+    webgpu/webgpu_storage_buffer.cc
+    webgpu/webgpu_texture.cc
+    webgpu/webgpu_texture_pool.cc
+    webgpu/webgpu_uniform_buffer.cc
+    webgpu/webgpu_vertex_buffer.cc
+
+    webgpu/webgpu_backend.hh
+    webgpu/webgpu_batch.hh
+    webgpu/webgpu_context.hh
+    webgpu/webgpu_framebuffer.hh
+    webgpu/webgpu_index_buffer.hh
+    webgpu/webgpu_shader.hh
+    webgpu/webgpu_shader_interface.hh
+    webgpu/webgpu_state.hh
+    webgpu/webgpu_storage_buffer.hh
+    webgpu/webgpu_texture.hh
+    webgpu/webgpu_texture_pool.hh
+    webgpu/webgpu_uniform_buffer.hh
+    webgpu/webgpu_vertex_buffer.hh
+  )
+  # Emscripten provides webgpu/webgpu.h via the emdawnwebgpu port
+  # (--use-port=emdawnwebgpu), wired in the top-level emscripten flags.
+  add_definitions(-DWITH_WEBGPU_BACKEND)
+  # Shader translation toolchain headers: shaderc (GLSL->SPIR-V) + Tint
+  # (SPIR-V->WGSL, from the Dawn source tree). Built by scripts/build_shaderc.sh,
+  # build_tint.sh, build_spirv_tools.sh.
+  list(APPEND INC_SYS
+    ${CMAKE_SOURCE_DIR}/../wasm-sysroot/include
+    ${CMAKE_SOURCE_DIR}/../deps/src/dawn
+    ${CMAKE_SOURCE_DIR}/../deps/build/tint
+  )
+endif()
+
 set(GLSL_SRC
   GPU_shader_shared.hh
 
@@ -917,6 +960,25 @@ target_link_libraries(bf_gpu PUBLIC
 # brought in by `blenlib/intern/system.cc`.
 if(HAVE_EXECINFO_H AND CMAKE_SYSTEM_NAME MATCHES "FreeBSD|NetBSD|OpenBSD|DragonFly")
   target_link_libraries(bf_gpu PUBLIC execinfo)
+endif()
+
+if(WITH_WEBGPU_BACKEND)
+  # Link the GLSL->SPIR-V->WGSL toolchain. The pass/type vtable-defining TUs in
+  # Tint + SPIRV-Tools are not pulled by normal static linking (manifests as a
+  # wasm "null function or function signature mismatch"), so wrap them in
+  # --whole-archive. shaderc + abseil resolve normally in a group. See
+  # full-blender-wasm-progress memory for the validated recipe.
+  set(_DEPS ${CMAKE_SOURCE_DIR}/../deps/build)
+  file(GLOB _TINT_LIBS "${_DEPS}/tint/src/tint/libtint*.a")
+  file(GLOB _ABSL_LIBS "${_DEPS}/tint/third_party/abseil/absl/*/libabsl*.a")
+  set(_SPV_LIBS
+    ${_DEPS}/spirv-tools/source/opt/libSPIRV-Tools-opt.a
+    ${_DEPS}/spirv-tools/source/libSPIRV-Tools.a)
+  target_link_libraries(bf_gpu PUBLIC
+    -Wl,--whole-archive ${_TINT_LIBS} ${_SPV_LIBS} -Wl,--no-whole-archive
+    ${CMAKE_SOURCE_DIR}/../wasm-sysroot/lib/libshaderc_combined.a
+    -Wl,--start-group ${_ABSL_LIBS} -Wl,--end-group
+  )
 endif()
 
 if(WITH_OPENSUBDIV)

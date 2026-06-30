@@ -241,7 +241,7 @@ static void image_foreach_cache(ID *id,
   }
 
   /* Ensure we don't collide with the identifiers used above. */
-  constexpr size_t runtime_base_id = size_t(1) << 32u;
+  constexpr uint64_t runtime_base_id = uint64_t(1) << 32u;
 
   key.identifier = runtime_base_id + offsetof(bke::ImageRuntime, cache);
   function_callback(id, &key, reinterpret_cast<void **>(&image->runtime->cache), 0, user_data);

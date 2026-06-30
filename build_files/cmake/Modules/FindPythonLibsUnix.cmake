@@ -50,7 +50,11 @@ if(APPLE)
   endif()
 else()
   # See: http://docs.python.org/extending/embedding.html#linking-requirements
-  set(PYTHON_LINKFLAGS "-Xlinker -export-dynamic" CACHE STRING "Linker flags for python")
+  if(EMSCRIPTEN)
+    set(PYTHON_LINKFLAGS "" CACHE STRING "Linker flags for python")  # WASM: -export-dynamic exports all symbols, exceeds V8 limit
+  else()
+    set(PYTHON_LINKFLAGS "-Xlinker -export-dynamic" CACHE STRING "Linker flags for python")
+  endif()
   mark_as_advanced(PYTHON_LINKFLAGS)
 endif()
 

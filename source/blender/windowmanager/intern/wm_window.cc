@@ -2375,6 +2375,10 @@ GHOST_TDrawingContextType wm_ghost_drawing_context_type(const GPUBackendType gpu
   switch (gpu_backend) {
     case GPU_BACKEND_NONE:
       return GHOST_kDrawingContextTypeNone;
+    case GPU_BACKEND_WEBGPU:
+      /* WebGPU has no GHOST drawing context: the device is obtained from JS
+       * (emscripten_webgpu_get_device), so there is no GHOST-managed context. */
+      return GHOST_kDrawingContextTypeNone;
     case GPU_BACKEND_ANY:
     case GPU_BACKEND_OPENGL:
 #ifdef WITH_OPENGL_BACKEND
@@ -3505,18 +3509,29 @@ GHOST_IContext *WM_system_gpu_context_create()
 void WM_system_gpu_context_dispose(GHOST_IContext *context)
 {
   BLI_assert(GPU_framebuffer_active_get() == GPU_framebuffer_back_get());
+  /* WASM/WebGPU: device comes from JS (emscripten_webgpu_get_device); there is
+   * no GHOST system GPU context to manage, so these may be passed null. */
+  if (context == nullptr) {
+    return;
+  }
   g_system->disposeContext(context);
 }
 
 void WM_system_gpu_context_activate(GHOST_IContext *context)
 {
   BLI_assert(GPU_framebuffer_active_get() == GPU_framebuffer_back_get());
+  if (context == nullptr) {
+    return;
+  }
   context->activateDrawingContext();
 }
 
 void WM_system_gpu_context_release(GHOST_IContext *context)
 {
   BLI_assert(GPU_framebuffer_active_get() == GPU_framebuffer_back_get());
+  if (context == nullptr) {
+    return;
+  }
   context->releaseDrawingContext();
 }
 

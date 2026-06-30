@@ -11,4 +11,5 @@ set(SRC
 
 # `SRC_DNA_INC` is defined in the parent directory.
 add_executable(datatoc ${SRC})
+blender_wasm_host_tool(datatoc)  # WASM: run via node at build time
 optimize_debug_target(datatoc)

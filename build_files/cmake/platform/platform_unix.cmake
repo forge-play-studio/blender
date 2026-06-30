@@ -138,7 +138,10 @@ find_package_wrapper(JPEG REQUIRED)
 find_package_wrapper(PNG REQUIRED)
 find_package_wrapper(ZLIB REQUIRED)
 find_package_wrapper(Zstd REQUIRED)
-find_package_wrapper(Epoxy REQUIRED)
+# WASM_PATCH_EPOXY: headless WASM build has no GL loader
+if(WITH_OPENGL_BACKEND)
+  find_package_wrapper(Epoxy REQUIRED)
+endif()
 find_package_wrapper(fmt REQUIRED)
 if(DEFINED fmt_DIR)
   # Hide the fmt_DIR from the standard user settings to be consistent with our
@@ -190,7 +193,8 @@ function(check_freetype_for_brotli)
   set(HAVE_BROTLI_INC "${FREETYPE_INCLUDE_DIRS}" CACHE INTERNAL "")
 endfunction()
 
-if(NOT WITH_SYSTEM_FREETYPE)
+# WASM_PATCH_FREETYPE: skip for headless (no text/UI) builds
+if(NOT WITH_SYSTEM_FREETYPE AND (WITH_BLENDER OR WITH_INTERNATIONAL))
   # FreeType compiled with Brotli compression for woff2.
   find_package_wrapper(Freetype REQUIRED)
   # CMake 3.28.1 defines this, it doesn't seem to be used, hide by default in the UI.
@@ -597,6 +601,8 @@ add_bundled_libraries(hiprt/lib)
 # OpenSuse needs lutil, ArchLinux not, for now keep, can avoid by using --as-needed
 if(HAIKU)
   list(APPEND PLATFORM_LINKLIBS -lnetwork)
+elseif(EMSCRIPTEN)
+  # WASM_PATCH_LINKLIBS: libc/libm implicit, no libutil
 else()
   list(APPEND PLATFORM_LINKLIBS -lutil -lc -lm)
 endif()
