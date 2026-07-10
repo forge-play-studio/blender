@@ -6,6 +6,7 @@
  * \ingroup gpu
  */
 
+#include <cstdio>
 #include <cstring>
 
 #include "MEM_guardedalloc.h"
@@ -30,6 +31,9 @@ WebGPUStorageBuf::WebGPUStorageBuf(size_t size, GPUUsageType usage, const char *
 
 WebGPUStorageBuf::~WebGPUStorageBuf()
 {
+  if (WebGPUContext *ctx = static_cast<WebGPUContext *>(Context::get())) {
+    ctx->scrub_buffer(buffer_);
+  }
   if (buffer_) {
     wgpuBufferRelease(buffer_);
     buffer_ = nullptr;
@@ -56,31 +60,59 @@ void WebGPUStorageBuf::ensure_buffer()
                WGPUBufferUsage_Indirect | WGPUBufferUsage_Vertex;
   desc.mappedAtCreation = false;
   buffer_ = wgpuDeviceCreateBuffer(ctx->device(), &desc);
-  /* Upload whatever the CPU shadow currently holds. */
+  /* Upload whatever the CPU shadow currently holds (fresh buffer — a queued
+   * write cannot affect recorded work, no flush needed). */
   if (buffer_) {
     wgpuQueueWriteBuffer(ctx->queue(), buffer_, 0, data_, alloc_size_);
   }
 }
 
+/* Copy-on-write for whole-buffer rewrites while a pass records: the recorded
+ * draws keep their refs to the old buffer; a fresh one avoids both the
+ * retroactive-write hazard and a full submit per update. Only valid because the
+ * caller rewrites the ENTIRE buffer from the CPU shadow (any GPU-written
+ * content is overwritten either way). */
+bool WebGPUStorageBuf::cow_if_pass_open(WebGPUContext *ctx)
+{
+  if (!ctx->pass_open() || buffer_ == nullptr) {
+    return false;
+  }
+  WGPUBufferDescriptor desc = {};
+  desc.size = alloc_size_;
+  desc.usage = WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc | WGPUBufferUsage_CopyDst |
+               WGPUBufferUsage_Indirect | WGPUBufferUsage_Vertex;
+  WGPUBuffer fresh = wgpuDeviceCreateBuffer(ctx->device(), &desc);
+  if (fresh == nullptr) {
+    return false;
+  }
+  ctx->rebind_buffer(buffer_, fresh);
+  wgpuBufferRelease(buffer_);
+  buffer_ = fresh;
+  return true;
+}
+
 void WebGPUStorageBuf::update(const void *data)
 {
-  fprintf(stderr, "WGPU_SSBO update this=%p size=%zu alloc=%zu data=%p\n",
-          (void *)this, size_in_bytes_, alloc_size_, data);
-  fflush(stderr);
   if (size_in_bytes_ > (size_t(1) << 31)) {
-    fprintf(stderr, "WGPU_SSBO BAD size_in_bytes_=%zu (skipping update)\n", size_in_bytes_);
-    fflush(stderr);
     return;
   }
   ensure_buffer();
-  fprintf(stderr, "WGPU_SSBO post-ensure data_=%p\n", data_); fflush(stderr);
   if (data && data_) {
+    /* NOTE: no unchanged-data early-out here — storage buffers can be
+     * GPU-written (compute) after our upload, so the CPU shadow matching the
+     * new data does NOT mean the GPU copy does. */
     memcpy(data_, data, size_in_bytes_);
   }
-  fprintf(stderr, "WGPU_SSBO post-memcpy ok\n"); fflush(stderr);
   WebGPUContext *ctx = webgpu_context_get();
   if (buffer_ && ctx && ctx->queue()) {
+    cow_if_pass_open(ctx);
     wgpuQueueWriteBuffer(ctx->queue(), buffer_, 0, data_, alloc_size_);
+    dirty_ = false;
+  }
+  else {
+    /* No context/device right now: upload at the next bind (else the GPU copy
+     * silently stays stale — this froze the per-sample RNG data). */
+    dirty_ = true;
   }
 }
 
@@ -88,9 +120,14 @@ void WebGPUStorageBuf::bind(int slot)
 {
   slot_ = slot;
   ensure_buffer();
+  WebGPUContext *ctx = webgpu_context_get();
+  if (dirty_ && buffer_ && data_ && ctx && ctx->queue()) {
+    cow_if_pass_open(ctx);
+    wgpuQueueWriteBuffer(ctx->queue(), buffer_, 0, data_, alloc_size_);
+    dirty_ = false;
+  }
   /* Record into the context binding table; the bind group is assembled at
    * draw/dispatch time from these + the pipeline's auto layout. */
-  WebGPUContext *ctx = webgpu_context_get();
   if (ctx) {
     ctx->bind_ssbo(slot, buffer_);
   }
@@ -118,6 +155,7 @@ void WebGPUStorageBuf::clear(uint32_t clear_value)
   }
   WebGPUContext *ctx = webgpu_context_get();
   if (buffer_ && ctx && ctx->queue()) {
+    cow_if_pass_open(ctx);
     wgpuQueueWriteBuffer(ctx->queue(), buffer_, 0, data_, alloc_size_);
   }
 }

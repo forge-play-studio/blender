@@ -31,6 +31,12 @@ struct TagUpdate {
   [[storage(6, read)]] const uint (&resource_ids_buf)[];
 };
 
+/* Read-only view of the tilemaps buffer: this pipeline only reads it, and
+ * WebGPU forbids read_write storage buffers in the vertex stage. */
+struct TileMapsRead {
+  [[storage(8, read)]] const ShadowTileMapData (&tilemaps_buf)[];
+};
+
 struct VertIn {
   [[attribute(0)]] float3 pos;
 };
@@ -41,7 +47,7 @@ struct VertOut {
 
 [[vertex]]
 void tag_update_vert([[resource_table]] TagUpdate &srt,
-                     [[resource_table]] TileMaps &tilemaps,
+                     [[resource_table]] TileMapsRead &tilemaps,
                      [[instance_id]] const int inst_per_tilemap_id,
                      [[in]] const VertIn &v_in,
                      [[out]] VertOut &v_out,
@@ -103,7 +109,7 @@ void tag_update_vert([[resource_table]] TagUpdate &srt,
 
 [[fragment]]
 void tag_update_frag([[resource_table]] Tiles &tiles,
-                     [[resource_table]] TileMaps &tilemaps,
+                     [[resource_table]] TileMapsRead &tilemaps,
                      [[frag_coord]] const float4 frag_coord,
                      [[in]] const VertOut &v_out)
 {

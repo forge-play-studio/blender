@@ -10,6 +10,11 @@
 
 #include "BKE_object_types.hh"
 
+#ifdef __EMSCRIPTEN__
+#  include "BKE_object.hh"
+#  include "BLI_math_geom_c.hh"
+#endif
+
 #include "DRW_gpu_wrapper.hh"
 
 #include "GPU_select.hh"
@@ -92,6 +97,11 @@ struct SelectMap {
   Vector<uint> select_id_map;
   /** Track objects with OB_DRAW_IN_FRONT. */
   Vector<bool> in_front_map;
+#ifdef __EMSCRIPTEN__
+  /** World-space AABB per internal id, for the CPU pick fallback (the WebGPU
+   * backend cannot read the GPU result back synchronously — no JSPI). */
+  Vector<std::pair<float3, float3>> bounds_map;
+#endif
 #ifndef NDEBUG
   /** Debug map containing a copy of the object name. */
   Vector<std::string> map_names;
@@ -124,6 +134,30 @@ struct SelectMap {
     uint object_id = ob_ref.object->runtime->select_id;
     uint id = select_id_map.append_and_get_index(object_id | sub_object_id);
     in_front_map.append(ob_ref.object->dtx & OB_DRAW_IN_FRONT);
+
+#ifdef __EMSCRIPTEN__
+    {
+      /* Record the world AABB for the CPU pick fallback (see read_result). */
+      float3 bmin(-0.5f), bmax(0.5f);
+      if (const std::optional<Bounds<float3>> b = BKE_object_boundbox_get(ob_ref.object)) {
+        bmin = b->min;
+        bmax = b->max;
+      }
+      else if (ob_ref.object->empty_drawsize > 0.0f) {
+        bmin = float3(-ob_ref.object->empty_drawsize);
+        bmax = float3(ob_ref.object->empty_drawsize);
+      }
+      const float4x4 &m = ob_ref.object->object_to_world();
+      float3 wmin(FLT_MAX), wmax(-FLT_MAX);
+      for (int c = 0; c < 8; c++) {
+        float3 p((c & 1) ? bmax.x : bmin.x, (c & 2) ? bmax.y : bmin.y, (c & 4) ? bmax.z : bmin.z);
+        p = math::transform_point(m, p);
+        wmin = math::min(wmin, p);
+        wmax = math::max(wmax, p);
+      }
+      bounds_map.append({wmin, wmax});
+    }
+#endif
 
 #ifdef DEBUG_PRINT
     /* Print mapping from object name, select id and the mapping to internal select id.
@@ -159,6 +193,9 @@ struct SelectMap {
 
     select_id_map.clear();
     in_front_map.clear();
+#ifdef __EMSCRIPTEN__
+    bounds_map.clear();
+#endif
 #ifndef NDEBUG
     map_names.clear();
 #endif
@@ -256,6 +293,73 @@ struct SelectMap {
     info_buf.push_update();
   }
 
+#ifdef __EMSCRIPTEN__
+  void cpu_pick_fallback()
+  {
+    View &view = View::default_get();
+    const float4x4 pv = view.winmat() * view.viewmat();
+    const float4x4 pv_inv = math::invert(pv);
+
+    if (info_buf.mode == SelectType::SELECT_ALL) {
+      /* Box/lasso "select everything in rect": the pick winmat maps the rect to
+       * the full NDC cube, so an object is inside iff its projected AABB
+       * overlaps [-1,1]². Conservative for corners behind the eye. */
+      for (const int i : bounds_map.index_range()) {
+        const float3 &bmin = bounds_map[i].first;
+        const float3 &bmax = bounds_map[i].second;
+        float2 ndc_min(FLT_MAX), ndc_max(-FLT_MAX);
+        bool any_behind = false;
+        for (int c = 0; c < 8; c++) {
+          float3 p((c & 1) ? bmax.x : bmin.x,
+                   (c & 2) ? bmax.y : bmin.y,
+                   (c & 4) ? bmax.z : bmin.z);
+          const float4 hp = pv * float4(p, 1.0f);
+          if (hp.w <= 1e-8f) {
+            any_behind = true;
+            continue;
+          }
+          const float2 ndc = float2(hp.x, hp.y) / hp.w;
+          ndc_min = math::min(ndc_min, ndc);
+          ndc_max = math::max(ndc_max, ndc);
+        }
+        const bool overlaps = any_behind || (ndc_min.x <= 1.0f && ndc_max.x >= -1.0f &&
+                                             ndc_min.y <= 1.0f && ndc_max.y >= -1.0f);
+        if (overlaps) {
+          select_output_buf[i / 32] |= 1u << (i % 32);
+        }
+      }
+      return;
+    }
+
+    /* Pick modes: ray through the rect center (the pick winmat centers the
+     * cursor at NDC (0,0)). */
+    const float3 p0 = math::project_point(pv_inv, float3(0.0f, 0.0f, -1.0f));
+    const float3 p1 = math::project_point(pv_inv, float3(0.0f, 0.0f, 1.0f));
+    const float3 dir = math::normalize(p1 - p0);
+    for (const int i : bounds_map.index_range()) {
+      const float3 &bmin = bounds_map[i].first;
+      const float3 &bmax = bounds_map[i].second;
+      float tmin = 0.0f;
+      if (!isect_ray_aabb_v3_simple(p0, dir, bmin, bmax, &tmin, nullptr)) {
+        continue;
+      }
+      const float3 hit = p0 + dir * math::max(tmin, 0.0f);
+      const float z01 = math::clamp(
+          math::project_point(pv, hit).z * 0.5f + 0.5f, 0.0f, 1.0f);
+      /* Match the shader encodings (select_lib.glsl). */
+      if (info_buf.mode == SelectType::SELECT_PICK_ALL) {
+        uint32_t bits;
+        const float zf = z01;
+        memcpy(&bits, &zf, sizeof(bits)); /* floatBitsToUint */
+        select_output_buf[i] = bits;
+      }
+      else { /* SELECT_PICK_NEAREST: (depth24 << 8) | cursor_dist8. */
+        select_output_buf[i] = (uint32_t(z01 * float(0x00FFFFFFu)) << 8u) | 0u;
+      }
+    }
+  }
+#endif
+
   void read_result()
   {
     if (selection_type == SelectionType::DISABLED) {
@@ -270,6 +374,14 @@ struct SelectMap {
      * workaround instead of being fixed in user code. */
     select_output_buf.async_flush_to_host();
     select_output_buf.read();
+
+#ifdef __EMSCRIPTEN__
+    /* The WebGPU backend cannot read GPU buffers back synchronously (no JSPI):
+     * select_output_buf still holds its clear pattern here. Synthesize the hits
+     * on the CPU from the world AABBs recorded at sync time. Approximate (bbox,
+     * not rasterized geometry), but it makes click/box select functional. */
+    cpu_pick_fallback();
+#endif
 
     Vector<GPUSelectResult> hit_results;
 

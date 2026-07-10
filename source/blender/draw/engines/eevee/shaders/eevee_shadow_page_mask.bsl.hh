@@ -55,11 +55,15 @@ void mask([[resource_table]] PageMask &srt,
   uint tilemap_index = global_id.z;
   ShadowTileMapData tilemap = tilemaps.tilemaps_buf[tilemap_index];
 
-  /* NOTE: Barriers are ok since this branch is taken by all threads. */
-  if (tilemap.projection_type == SHADOW_PROJECTION_CUBEFACE) {
+  /* All threads of a workgroup share the same tilemap, so this branch is
+   * uniform in practice — but WGSL uniformity analysis cannot prove it (the
+   * condition derives from a storage-buffer load). Keep the barriers in
+   * top-level uniform control flow and guard only the work with `is_cubeface`. */
+  bool is_cubeface = (tilemap.projection_type == SHADOW_PROJECTION_CUBEFACE);
+  {
     /* Check if any page is allocated in this tilemap. Force base page if that's the case to avoid
      * artifact during shadow tracing. */
-    if (local_tile_index == 0u) {
+    if (is_cubeface && local_tile_index == 0u) {
       srt.force_base_page = 0u;
     }
     barrier();
@@ -67,7 +71,7 @@ void mask([[resource_table]] PageMask &srt,
     /* Load all data to LDS. Allows us to do some modification on the flag bits and only flush to
      * main memory the usage bit. */
     for (int lod = 0; lod <= SHADOW_TILEMAP_LOD; lod++) {
-      if (thread_mask(tile_co, lod)) {
+      if (is_cubeface && thread_mask(tile_co, lod)) {
         int tile_offset = shadow_tile_offset(uint2(tile_co), tilemap.tiles_index, lod);
         ShadowTileDataPacked tile_data = srt.tiles_buf[tile_offset];
 
@@ -97,7 +101,7 @@ void mask([[resource_table]] PageMask &srt,
      * different LODs. */
     for (int lod = 1; lod <= SHADOW_TILEMAP_LOD; lod++) {
       barrier();
-      if (thread_mask(tile_co, lod)) {
+      if (is_cubeface && thread_mask(tile_co, lod)) {
         int2 tile_co_prev_lod = tile_co * 2;
         int prev_lod = lod - 1;
 
@@ -133,13 +137,13 @@ void mask([[resource_table]] PageMask &srt,
      * The clamped LOD levels' tiles need to be merged to the highest LOD allowed. */
 
     /* Construct bitmask of LODs that contain tiles to render (i.e: that will request a view). */
-    if (local_tile_index == 0u) {
+    if (is_cubeface && local_tile_index == 0u) {
       srt.levels_rendered = 0u;
     }
     barrier();
     for (int lod = 0; lod <= SHADOW_TILEMAP_LOD; lod++) {
       /* TODO(fclem): Could maybe speedup using WaveAllBitOr. */
-      if (thread_mask(tile_co, lod)) {
+      if (is_cubeface && thread_mask(tile_co, lod)) {
         int tile_offset = shadow_tile_offset_lds(tile_co, lod);
         if ((srt.tiles_local[tile_offset] & SHADOW_DO_UPDATE) != 0) {
           atomicOr(srt.levels_rendered, 1u << lod);
@@ -149,7 +153,7 @@ void mask([[resource_table]] PageMask &srt,
     barrier();
 
     /* If there is more LODs to update than the load balancing heuristic allows. */
-    if (bitCount(srt.levels_rendered) > srt.max_view_per_tilemap) {
+    if (is_cubeface && bitCount(srt.levels_rendered) > srt.max_view_per_tilemap) {
       /* Find the cutoff LOD that contain tiles to render. */
       int max_lod = findMSB(srt.levels_rendered);
       /* Allow more than one level. */
@@ -177,7 +181,7 @@ void mask([[resource_table]] PageMask &srt,
         }
       }
     }
-    else {
+    else if (is_cubeface) {
       /* NOTE: Concurrent writing of the same value to the same data. */
       tilemaps.tilemaps_buf[tilemap_index].effective_lod_min = 0;
     }
@@ -189,7 +193,7 @@ void mask([[resource_table]] PageMask &srt,
     barrier();
 
 #if 1 /* Can be disabled for debugging. */
-    if (local_tile_index == 0u) {
+    if (is_cubeface && local_tile_index == 0u) {
       /* WATCH: To be kept in sync with `max_view_per_tilemap()` function. */
       bool is_render = srt.max_view_per_tilemap == SHADOW_TILEMAP_LOD;
       /* Tag base page to be rendered if any other tile is needed by this shadow.
@@ -209,7 +213,7 @@ void mask([[resource_table]] PageMask &srt,
 
     /* Flush back visibility bits to the tile SSBO. */
     for (int lod = 0; lod <= SHADOW_TILEMAP_LOD; lod++) {
-      if (thread_mask(tile_co, lod)) {
+      if (is_cubeface && thread_mask(tile_co, lod)) {
         int tile_lds = shadow_tile_offset_lds(tile_co, lod);
         if ((srt.tiles_local[tile_lds] & SHADOW_TILE_AMENDED) != 0) {
           int tile_offset = shadow_tile_offset(uint2(tile_co), tilemap.tiles_index, lod);

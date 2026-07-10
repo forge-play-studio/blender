@@ -21,6 +21,8 @@
 
 namespace blender::gpu {
 
+class WebGPUContext;
+
 class WebGPUStorageBuf : public StorageBuf {
  private:
   /** Lazily-created GPU buffer; null until a device is available. */
@@ -29,9 +31,13 @@ class WebGPUStorageBuf : public StorageBuf {
   int slot_ = -1;
   /** Allocation size, rounded up to 4 bytes as WebGPU requires. */
   size_t alloc_size_ = 0;
+  /* CPU shadow updated while no GPU context was active; upload on next bind. */
+  bool dirty_ = false;
 
   /** Ensure the CPU shadow (data_) exists; create GPU buffer if a device is up. */
   void ensure_buffer();
+  /* Swap in a fresh WGPUBuffer for whole-buffer rewrites mid-pass (see impl). */
+  bool cow_if_pass_open(WebGPUContext *ctx);
 
  public:
   WebGPUStorageBuf(size_t size, GPUUsageType usage, const char *name);

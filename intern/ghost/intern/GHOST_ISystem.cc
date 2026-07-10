@@ -22,6 +22,8 @@
 #  include "GHOST_SystemX11.hh"
 #elif defined(WITH_GHOST_WAYLAND)
 #  include "GHOST_SystemWayland.hh"
+#elif defined(WITH_GHOST_WEB)
+#  include "GHOST_SystemWeb.hh"
 #elif defined(WITH_GHOST_SDL)
 #  include "GHOST_SystemSDL.hh"
 #elif defined(WIN32)
@@ -140,6 +142,10 @@ GHOST_TSuccess GHOST_ISystem::createSystem(bool verbose, [[maybe_unused]] bool b
     else {
       system_ = nullptr;
     }
+#elif defined(WITH_GHOST_WEB)
+    backends_attempted.push_back({"WEB"});
+    CLOG_INFO(&LOG, "Create Web (Emscripten) system");
+    system_ = new GHOST_SystemWeb();
 #elif defined(WITH_GHOST_SDL)
     backends_attempted.push_back({"SDL"});
     try {

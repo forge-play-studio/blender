@@ -204,6 +204,15 @@ void GPU_texture_update_mipmap_chain(Texture *tex)
 
   bool use_compute_shaders = true;
 
+#ifdef __EMSCRIPTEN__
+  /* The compute updater relies on multi-mip storage-image bindings + shared
+   * memory reductions that are not yet reliable through the SPIR-V→WGSL path
+   * (garbage mips 1+ made mipmapped image display show recycled texture
+   * content). The WebGPU backend has a render-pass based downsampler —
+   * use it. */
+  use_compute_shaders = false;
+#endif
+
   if ((tex->usage_get() & GPU_TEXTURE_USAGE_SHADER_WRITE) == 0) {
     CLOG_TRACE(&LOG,
                "Texture doesn't have `GPU_TEXTURE_USAGE_SHADER_WRITE` set. Fallback to backend "

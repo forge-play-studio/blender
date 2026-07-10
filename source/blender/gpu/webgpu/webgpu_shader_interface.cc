@@ -12,6 +12,8 @@
 
 #include "BLI_vector.hh"
 
+#include <cstdio>
+
 namespace blender::gpu {
 
 using namespace blender::gpu::shader;
@@ -108,7 +110,9 @@ void WebGPUShaderInterface::init(const shader::ShaderCreateInfo &info)
   /* --- counts (flat array order: Attributes, Ubos, Uniforms, SSBOs, Constants) --- */
   attr_len_ = info.vertex_inputs_.size();
   ubo_len_ = 0;
-  uniform_len_ = info.push_constants_.size();
+  /* +subpass inputs: each gets a hidden emulation sampler `gpu_subpass_img_<i>`
+   * (see fragment_interface_declare) resolved at texture slot <i>. */
+  uniform_len_ = info.push_constants_.size() + info.subpass_inputs_.size();
   ssbo_len_ = 0;
   constant_len_ = info.specialization_constants_.size();
 
@@ -139,6 +143,7 @@ void WebGPUShaderInterface::init(const shader::ShaderCreateInfo &info)
   }
 
   size_t names_size = info.interface_names_size_;
+  names_size += info.subpass_inputs_.size() * 24; /* "gpu_subpass_img_<i>" + NUL */
   const int input_tot_len = attr_len_ + ubo_len_ + uniform_len_ + ssbo_len_ + constant_len_;
   inputs_ = MEM_new_array_zeroed<ShaderInput>(input_tot_len, __func__);
   name_buffer_ = MEM_new_array_uninitialized<char>(names_size, "name_buffer");
@@ -189,6 +194,16 @@ void WebGPUShaderInterface::init(const shader::ShaderCreateInfo &info)
       input++;
     }
   }
+  /* Sub-pass input emulation samplers (fragment-only). */
+  for (const ShaderCreateInfo::SubpassIn &sp : info.subpass_inputs_) {
+    char sp_name[24];
+    snprintf(sp_name, sizeof(sp_name), "gpu_subpass_img_%d", sp.index);
+    copy_input_name(input, sp_name, name_buffer_, name_offset);
+    input->binding = sp.index;
+    input->location = 200 + sp.index;
+    enabled_tex_mask_ |= (1ull << sp.index);
+    input++;
+  }
   set_image_formats_from_info(info);
 
   /* --- Push constants. location = std140 BYTE OFFSET into the `constants` block
@@ -211,7 +226,12 @@ void WebGPUShaderInterface::init(const shader::ShaderCreateInfo &info)
     if (res->bind_type == ShaderCreateInfo::Resource::BindType::STORAGE_BUFFER) {
       copy_input_name(input, res->storagebuf.name, name_buffer_, name_offset);
       input->binding = res->slot;
-      input->location = resource_binding(info, *res);
+      /* GPU_shader_get_ssbo_binding returns ->location (unlike UBO/samplers,
+       * which return ->binding): DRW's by-NAME ssbo binds use it as the bind
+       * slot, so it must be the Blender slot — NOT the flat WGSL index — or
+       * name-bound buffers land in the wrong table entry (this broke light
+       * culling and the shadow pipeline: wrong/aliased buffers per dispatch). */
+      input->location = res->slot;
       enabled_ssbo_mask_ |= (1 << res->slot);
       input++;
     }

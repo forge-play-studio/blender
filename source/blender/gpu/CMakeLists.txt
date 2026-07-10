@@ -479,6 +479,7 @@ if(WITH_WEBGPU_BACKEND)
     webgpu/webgpu_batch.cc
     webgpu/webgpu_context.cc
     webgpu/webgpu_framebuffer.cc
+    webgpu/webgpu_immediate.cc
     webgpu/webgpu_index_buffer.cc
     webgpu/webgpu_shader.cc
     webgpu/webgpu_shader_interface.cc
@@ -493,6 +494,7 @@ if(WITH_WEBGPU_BACKEND)
     webgpu/webgpu_batch.hh
     webgpu/webgpu_context.hh
     webgpu/webgpu_framebuffer.hh
+    webgpu/webgpu_immediate.hh
     webgpu/webgpu_index_buffer.hh
     webgpu/webgpu_shader.hh
     webgpu/webgpu_shader_interface.hh
@@ -504,8 +506,11 @@ if(WITH_WEBGPU_BACKEND)
     webgpu/webgpu_vertex_buffer.hh
   )
   # Emscripten provides webgpu/webgpu.h via the emdawnwebgpu port
-  # (--use-port=emdawnwebgpu), wired in the top-level emscripten flags.
+  # (--use-port=emdawnwebgpu). Scope it to this module's compiles so the port's
+  # own webgpu.h (matching the port's JS bridge linked into the final exe) is on
+  # the include path; the final-exe link adds --use-port via CMAKE_EXE_LINKER_FLAGS.
   add_definitions(-DWITH_WEBGPU_BACKEND)
+  add_compile_options(--use-port=emdawnwebgpu)
   # Shader translation toolchain headers: shaderc (GLSL->SPIR-V) + Tint
   # (SPIR-V->WGSL, from the Dawn source tree). Built by scripts/build_shaderc.sh,
   # build_tint.sh, build_spirv_tools.sh.

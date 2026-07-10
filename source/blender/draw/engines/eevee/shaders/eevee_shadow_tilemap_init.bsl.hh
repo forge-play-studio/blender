@@ -103,8 +103,11 @@ void tilemap_init_main([[resource_table]] TilemapInit &srt,
 
   int lod_max = (tilemap.projection_type == SHADOW_PROJECTION_CUBEFACE) ? SHADOW_TILEMAP_LOD : 0;
   uint lod_size = uint(SHADOW_TILEMAP_RES);
-  for (int lod = 0; lod <= lod_max; lod++, lod_size >>= 1u) {
-    bool thread_active = all(lessThan(tile_co, int2(int(lod_size))));
+  /* Constant trip count so the barrier below sits in provably-uniform control
+   * flow (WGSL uniformity analysis cannot prove `lod_max` uniform — it derives
+   * from a storage-buffer load). Inactive iterations are masked instead. */
+  for (int lod = 0; lod <= SHADOW_TILEMAP_LOD; lod++, lod_size >>= 1u) {
+    bool thread_active = (lod <= lod_max) && all(lessThan(tile_co, int2(int(lod_size))));
     ShadowTileDataPacked tile = 0;
     int tile_load = shadow_tile_offset(uint2(tile_wrapped), tilemap.tiles_index, lod);
     if (thread_active) {

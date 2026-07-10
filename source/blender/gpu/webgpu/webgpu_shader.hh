@@ -47,6 +47,15 @@ struct WgslResourceBinding {
   bool writable = false; /* read_write storage buffer / storage texture */
 };
 
+/* One @location the vertex entry point consumes (parsed from the WGSL). WebGPU
+ * validation requires EVERY shader input location to be fed by the pipeline's
+ * VertexState (GL fetches a default for unbound attributes), so draws pad the
+ * locations the batch doesn't supply with a null buffer. */
+struct WgslVertexInput {
+  uint32_t location;
+  WGPUVertexFormat format;
+};
+
 class WebGPUShader : public Shader {
  private:
   std::string vertex_src_;
@@ -67,18 +76,41 @@ class WebGPUShader : public Shader {
   WGPUShaderModule compute_module_ = nullptr;
 
   bool valid_ = false;
+  /* GLSL→WGSL translation is deferred to first use (see ensure_translated). */
+  bool translate_attempted_ = false;
+  /* Point-sprite expansion eligibility (set from the pre-patch GLSL). */
+  bool writes_point_size_ = false;
+  bool uses_vertex_id_ = false;
+  bool uses_point_coord_ = false;
 
   /* Bindings parsed from the generated WGSL (union of vert+frag for graphics). */
   std::vector<WgslResourceBinding> render_bindings_;
   std::vector<WgslResourceBinding> compute_bindings_;
+  /* Bit i set = fragment entry point writes @location(i). */
+  uint32_t frag_output_mask_ = 0;
+  /* Vertex input locations the vertex entry point consumes. */
+  std::vector<WgslVertexInput> vertex_inputs_;
 
-  /* Push-constant block backed by a uniform buffer (WGSL exposes push constants
-   * as a `constants` uniform block). uniform_float/int write the CPU shadow which
-   * is uploaded lazily; bound when a `constants` binding is present. */
-  WGPUBuffer push_const_buffer_ = nullptr;
+  /* Push-constant block backed by a uniform-buffer SLICE from the context's
+   * transient arena (WGSL exposes push constants as a `constants` uniform
+   * block). uniform_float/int write the CPU shadow; on dirty the shadow is
+   * uploaded into a FRESH arena slice — earlier recorded draws keep referencing
+   * their own slices, so no pass flush/submit is needed (a persistent per-shader
+   * buffer would need a full submit per update to preserve GL ordering). The
+   * cached slice buffer holds a ref (the arena rolls over). */
+  WGPUBuffer pc_slice_buf_ = nullptr;
+  uint64_t pc_slice_off_ = 0;
+  uint32_t pc_slice_epoch_ = 0;
   uint8_t *push_const_data_ = nullptr;
   size_t push_const_size_ = 0;
   bool push_const_dirty_ = false;
+
+  /* Specialization-constant values from the most recent bind() (defaults until
+   * a pass calls specialize_constant). Index i corresponds to constant_id=i in
+   * the generated GLSL preamble. */
+  shader::SpecializationConstants spec_state_;
+  /* Stable storage for WGPUConstantEntry keys ("0", "1", ...). */
+  std::vector<std::string> spec_keys_;
 
  public:
   WebGPUShader(const char *name);
@@ -86,7 +118,20 @@ class WebGPUShader : public Shader {
 
   const std::vector<WgslResourceBinding> &render_bindings() const { return render_bindings_; }
   const std::vector<WgslResourceBinding> &compute_bindings() const { return compute_bindings_; }
-  WGPUBuffer push_const_buffer();
+  uint32_t fragment_output_mask() const { return frag_output_mask_; }
+  const std::vector<WgslVertexInput> &vertex_inputs() const { return vertex_inputs_; }
+  /* Point draws of this shader can expand to per-instance quads. */
+  /* gl_VertexID remaps to the instance index under expansion (see the patch
+   * define), so vertex-id-using point shaders expand fine. */
+  bool can_expand_points() const
+  {
+    return writes_point_size_;
+  }
+  /* Upload-on-dirty push-constant slice; false when the shader has none. */
+  bool push_const_slice(WGPUBuffer &r_buf, uint64_t &r_off, uint64_t &r_size);
+  /* Run the deferred GLSL→SPIR-V→WGSL translation + WGSL metadata parsing.
+   * Called at first draw/dispatch (module accessors call it too). */
+  void ensure_translated();
 
   const std::string &vertex_wgsl() const { return vertex_wgsl_; }
   const std::string &fragment_wgsl() const { return fragment_wgsl_; }
@@ -118,8 +163,25 @@ class WebGPUShader : public Shader {
   bool finalize(const shader::ShaderCreateInfo *info = nullptr) override;
   void warm_cache(int /*limit*/) override {}
 
-  void bind(const shader::SpecializationConstants * /*constants_state*/) override {}
+  void bind(const shader::SpecializationConstants *constants_state) override
+  {
+    if (constants_state != nullptr) {
+      spec_state_ = *constants_state;
+    }
+    else if (constants) {
+      spec_state_ = *constants;
+    }
+  }
   void unbind() override {}
+
+  /* WGSL `override` specialization: spec constants survive GLSL→SPIR-V→WGSL as
+   * `@id(N) override` declarations; the per-submit values (from bind()) are fed
+   * to pipeline creation as WGPUConstantEntry overrides. Entries are emitted
+   * only for ids actually present in the stage's WGSL — Dawn rejects constant
+   * keys that don't match any override (a stage that never uses a constant has
+   * no override for it). */
+  uint64_t spec_hash() const;
+  void spec_entries(const std::string &wgsl, std::vector<WGPUConstantEntry> &out);
 
   /* location is the std140 byte offset into the push-constant block (assigned by
    * WebGPUShaderInterface). Writes into the CPU shadow + marks it dirty for the

@@ -8,6 +8,9 @@
 
 #include <cstring>
 
+#include "BLI_math_half.hh"
+#include <cstdlib>
+
 #include "webgpu_context.hh"
 #include "webgpu_texture.hh"
 
@@ -38,12 +41,18 @@ WGPUTextureFormat webgpu_texture_format(TextureFormat format)
       return WGPUTextureFormat_R16Float;
     case TextureFormat::SFLOAT_16_16:
       return WGPUTextureFormat_RG16Float;
+    case TextureFormat::SFLOAT_16_16_16:
+      /* No RGB formats in WebGPU: pad to RGBA (uploads expand, alpha = 1).
+       * MISSING THIS mapped OCIO's AgX 3D LUT to the default RGBA8Unorm with a
+       * misaligned upload — every AgX/Filmic view transform showed false-color
+       * garbage. */
     case TextureFormat::SFLOAT_16_16_16_16:
       return WGPUTextureFormat_RGBA16Float;
     case TextureFormat::SFLOAT_32:
       return WGPUTextureFormat_R32Float;
     case TextureFormat::SFLOAT_32_32:
       return WGPUTextureFormat_RG32Float;
+    case TextureFormat::SFLOAT_32_32_32:
     case TextureFormat::SFLOAT_32_32_32_32:
       return WGPUTextureFormat_RGBA32Float;
     case TextureFormat::UINT_32:
@@ -73,14 +82,43 @@ WGPUTextureFormat webgpu_texture_format(TextureFormat format)
   }
 }
 
-/* WebGPU only permits STORAGE_BINDING on a fixed set of formats (without optional
- * features). EEVEE liberally tags textures SHADER_WRITE in formats that are not
- * storage-capable in WebGPU (srgb, R16Float, RG11B10Ufloat, 8/16-bit norm, depth,
- * rgb10a2). Adding StorageBinding to those makes the whole texture invalid, which
- * cascades. Gate the flag so the texture is at least created as sampled/attachment.
- * (Correct EEVEE behaviour will need format substitution — tracked separately.) */
-static bool webgpu_format_supports_storage(WGPUTextureFormat f)
+/* WebGPU only permits STORAGE_BINDING on a fixed set of formats. EEVEE liberally
+ * tags textures SHADER_WRITE in formats outside the base set (R16Float,
+ * RG11B10Ufloat, 8/16-bit int, rgb10a2, ...). Those become storage-capable when
+ * the device has `texture-formats-tier1` (requested by the JS harness when the
+ * adapter exposes it), so gate on the device feature: with tier1 the whole EEVEE
+ * set gets StorageBinding; without it fall back to the base list so texture
+ * creation at least succeeds as sampled/attachment. */
+static bool webgpu_format_supports_storage(WGPUTextureFormat f, WGPUDevice device)
 {
+  static int tier1 = -1;
+  if (tier1 < 0 && device != nullptr) {
+    tier1 = wgpuDeviceHasFeature(device, WGPUFeatureName_TextureFormatsTier1) ? 1 : 0;
+  }
+  if (tier1 == 1) {
+    switch (f) {
+      case WGPUTextureFormat_R8Unorm:
+      case WGPUTextureFormat_R8Snorm:
+      case WGPUTextureFormat_R8Uint:
+      case WGPUTextureFormat_R8Sint:
+      case WGPUTextureFormat_RG8Unorm:
+      case WGPUTextureFormat_RG8Snorm:
+      case WGPUTextureFormat_RG8Uint:
+      case WGPUTextureFormat_RG8Sint:
+      case WGPUTextureFormat_R16Uint:
+      case WGPUTextureFormat_R16Sint:
+      case WGPUTextureFormat_R16Float:
+      case WGPUTextureFormat_RG16Uint:
+      case WGPUTextureFormat_RG16Sint:
+      case WGPUTextureFormat_RG16Float:
+      case WGPUTextureFormat_RGB10A2Uint:
+      case WGPUTextureFormat_RGB10A2Unorm:
+      case WGPUTextureFormat_RG11B10Ufloat:
+        return true;
+      default:
+        break;
+    }
+  }
   switch (f) {
     case WGPUTextureFormat_R32Uint:
     case WGPUTextureFormat_R32Sint:
@@ -104,13 +142,15 @@ static bool webgpu_format_supports_storage(WGPUTextureFormat f)
   }
 }
 
-static WGPUTextureUsage webgpu_texture_usage(eGPUTextureUsage usage, WGPUTextureFormat format)
+static WGPUTextureUsage webgpu_texture_usage(eGPUTextureUsage usage,
+                                             WGPUTextureFormat format,
+                                             WGPUDevice device)
 {
   WGPUTextureUsage flags = WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
   if (usage & GPU_TEXTURE_USAGE_SHADER_READ) {
     flags |= WGPUTextureUsage_TextureBinding;
   }
-  if ((usage & GPU_TEXTURE_USAGE_SHADER_WRITE) && webgpu_format_supports_storage(format)) {
+  if ((usage & GPU_TEXTURE_USAGE_SHADER_WRITE) && webgpu_format_supports_storage(format, device)) {
     flags |= WGPUTextureUsage_StorageBinding;
   }
   if (usage & GPU_TEXTURE_USAGE_ATTACHMENT) {
@@ -159,11 +199,27 @@ WebGPUTexture::WebGPUTexture(const char *name) : Texture(name) {}
 
 WebGPUTexture::~WebGPUTexture()
 {
+  WebGPUContext::scrub_texture_all_contexts(this);
+  for (auto &kv : attachment_views_) {
+    if (kv.second) {
+      wgpuTextureViewRelease(kv.second);
+    }
+  }
+  if (sample_view_) {
+    wgpuTextureViewRelease(sample_view_);
+  }
+  if (storage_view_) {
+    wgpuTextureViewRelease(storage_view_);
+  }
   if (view_) {
     wgpuTextureViewRelease(view_);
   }
   if (texture_) {
-    wgpuTextureDestroy(texture_);
+    /* Release only — NEVER wgpuTextureDestroy. Blender frees textures that
+     * pending (unsubmitted) command buffers still reference (legal in GL);
+     * Destroy would poison the whole submit ("Destroyed texture used in a
+     * submit"), dropping every draw in the frame. Dropping the last ref lets
+     * Dawn reclaim the memory once queued work completes. */
     wgpuTextureRelease(texture_);
   }
 }
@@ -180,17 +236,46 @@ bool WebGPUTexture::init_internal()
   }
 
   WGPUTextureDescriptor desc = {};
-  desc.dimension = (type_ & GPU_TEXTURE_3D) ? WGPUTextureDimension_3D :
-                   (type_ & GPU_TEXTURE_1D) ? WGPUTextureDimension_1D :
-                                              WGPUTextureDimension_2D;
+  /* 1D (and 1D-array) textures are PROMOTED to 2D with height 1: WGSL has no
+   * 1D array textures at all, and Tint's SPIR-V reader mis-types plain 1D
+   * textureDimensions (u32 vs vec2<u32>). The GLSL is patched to match
+   * (webgpu_shader.cc promote_1d_samplers). Blender stores 1D-array layer
+   * counts in h_, which promotion moves to the array-layer axis. */
+  desc.dimension = (type_ & GPU_TEXTURE_3D) ? WGPUTextureDimension_3D : WGPUTextureDimension_2D;
   desc.size.width = std::max(w_, 1);
-  desc.size.height = (desc.dimension == WGPUTextureDimension_1D) ? 1 : std::max(h_, 1);
+  desc.size.height = (type_ & GPU_TEXTURE_1D) ? 1 : std::max(h_, 1);
   /* depthOrArrayLayers: 3D depth, or array layer count, min 1. */
-  desc.size.depthOrArrayLayers = std::max(d_, 1);
+  desc.size.depthOrArrayLayers = (type_ & GPU_TEXTURE_1D) ?
+                                     ((type_ & GPU_TEXTURE_ARRAY) ? std::max(h_, 1) : 1) :
+                                     std::max(d_, 1);
   desc.format = wgpu_format_;
   desc.mipLevelCount = std::max(mipmaps_, 1);
   desc.sampleCount = 1;
-  desc.usage = webgpu_texture_usage(gpu_image_usage_flags_, wgpu_format_);
+  desc.usage = webgpu_texture_usage(gpu_image_usage_flags_, wgpu_format_, ctx->device());
+  /* Mipmaps are generated with a blit render pass (compute mipgen is disabled
+   * on this backend), so every mip level becomes a color attachment. Image
+   * textures request SHADER_READ only — without this, mipgen poisons the whole
+   * frame's command buffer ("usage doesn't include RenderAttachment"). */
+  if (desc.mipLevelCount > 1 && !is_depth_format()) {
+    switch (wgpu_format_) {
+      case WGPUTextureFormat_RGBA8Unorm:
+      case WGPUTextureFormat_RGBA8UnormSrgb:
+      case WGPUTextureFormat_R8Unorm:
+      case WGPUTextureFormat_RG8Unorm:
+      case WGPUTextureFormat_RGBA16Float:
+      case WGPUTextureFormat_RG16Float:
+      case WGPUTextureFormat_R16Float:
+      case WGPUTextureFormat_RGBA32Float:
+      case WGPUTextureFormat_RG32Float:
+      case WGPUTextureFormat_R32Float:
+      case WGPUTextureFormat_RGB10A2Unorm:
+      case WGPUTextureFormat_RG11B10Ufloat:
+        desc.usage |= WGPUTextureUsage_RenderAttachment;
+        break;
+      default:
+        break;
+    }
+  }
 
   texture_ = wgpuDeviceCreateTexture(ctx->device(), &desc);
   if (texture_ == nullptr) {
@@ -199,7 +284,6 @@ bool WebGPUTexture::init_internal()
   WGPUTextureViewDescriptor vdesc = {};
   vdesc.format = wgpu_format_;
   vdesc.dimension = (desc.dimension == WGPUTextureDimension_3D) ? WGPUTextureViewDimension_3D :
-                    (desc.dimension == WGPUTextureDimension_1D) ? WGPUTextureViewDimension_1D :
                     (type_ & GPU_TEXTURE_CUBE)                  ? WGPUTextureViewDimension_Cube :
                     (type_ & GPU_TEXTURE_ARRAY) ? WGPUTextureViewDimension_2DArray :
                                                   WGPUTextureViewDimension_2D;
@@ -213,6 +297,102 @@ bool WebGPUTexture::init_internal()
   return true;
 }
 
+static bool webgpu_format_has_stencil(WGPUTextureFormat f)
+{
+  return f == WGPUTextureFormat_Depth24PlusStencil8 ||
+         f == WGPUTextureFormat_Depth32FloatStencil8;
+}
+
+WGPUTextureView WebGPUTexture::wgpu_attachment_view(int layer, int mip)
+{
+  if (texture_ == nullptr) {
+    return nullptr;
+  }
+  const uint32_t l = uint32_t(std::max(layer, 0) + view_layer_);
+  const uint32_t m = uint32_t(std::max(mip, 0) + view_mip_);
+  const uint32_t key = (l << 8) | m;
+  auto it = attachment_views_.find(key);
+  if (it != attachment_views_.end()) {
+    return it->second;
+  }
+  WGPUTextureViewDescriptor vd = {};
+  vd.format = wgpu_format_;
+  vd.dimension = WGPUTextureViewDimension_2D;
+  vd.baseMipLevel = m;
+  vd.mipLevelCount = 1;
+  vd.baseArrayLayer = l;
+  vd.arrayLayerCount = 1;
+  WGPUTextureView v = wgpuTextureCreateView(texture_, &vd);
+  attachment_views_[key] = v;
+  return v;
+}
+
+WGPUTextureView WebGPUTexture::wgpu_sample_view()
+{
+  if (!webgpu_format_has_stencil(wgpu_format_)) {
+    return view_;
+  }
+  if (sample_view_ == nullptr && texture_ != nullptr) {
+    WGPUTextureViewDescriptor vd = {};
+    /* A single-aspect view's format is the aspect's format, not the combined
+     * depth-stencil format. */
+    vd.format = (wgpu_format_ == WGPUTextureFormat_Depth32FloatStencil8) ?
+                    WGPUTextureFormat_Depth32Float :
+                    WGPUTextureFormat_Depth24Plus;
+    vd.dimension = (type_ & GPU_TEXTURE_ARRAY) ? WGPUTextureViewDimension_2DArray :
+                                                 WGPUTextureViewDimension_2D;
+    vd.baseMipLevel = 0;
+    vd.mipLevelCount = 1;
+    vd.baseArrayLayer = 0;
+    vd.arrayLayerCount = (type_ & GPU_TEXTURE_ARRAY) ? uint32_t(std::max(d_, 1)) : 1;
+    vd.aspect = WGPUTextureAspect_DepthOnly;
+    sample_view_ = wgpuTextureCreateView(texture_, &vd);
+  }
+  return sample_view_;
+}
+
+WGPUTextureView WebGPUTexture::make_view_of(WGPUTexture other)
+{
+  if (other == nullptr) {
+    return nullptr;
+  }
+  WGPUTextureViewDescriptor vd = {};
+  vd.format = wgpu_format_;
+  vd.dimension = (type_ & GPU_TEXTURE_3D)    ? WGPUTextureViewDimension_3D :
+                 (type_ & GPU_TEXTURE_CUBE)  ? WGPUTextureViewDimension_Cube :
+                 (type_ & GPU_TEXTURE_ARRAY) ? WGPUTextureViewDimension_2DArray :
+                                               WGPUTextureViewDimension_2D;
+  vd.baseMipLevel = uint32_t(view_mip_);
+  vd.mipLevelCount = uint32_t(std::max(mipmaps_, 1));
+  vd.baseArrayLayer = uint32_t(view_layer_);
+  vd.arrayLayerCount = (vd.dimension == WGPUTextureViewDimension_2DArray) ?
+                           uint32_t(std::max((type_ & GPU_TEXTURE_1D) ? h_ : d_, 1)) :
+                       (vd.dimension == WGPUTextureViewDimension_Cube) ? 6u : 1u;
+  return wgpuTextureCreateView(other, &vd);
+}
+
+WGPUTextureView WebGPUTexture::wgpu_storage_view()
+{
+  if (mipmaps_ <= 1 && !is_view_) {
+    return view_; /* Default view already spans exactly one mip. */
+  }
+  if (storage_view_ == nullptr && texture_ != nullptr) {
+    WGPUTextureViewDescriptor vd = {};
+    vd.format = wgpu_format_;
+    vd.dimension = (type_ & GPU_TEXTURE_3D)    ? WGPUTextureViewDimension_3D :
+                   (type_ & GPU_TEXTURE_ARRAY) ? WGPUTextureViewDimension_2DArray :
+                                                 WGPUTextureViewDimension_2D;
+    vd.baseMipLevel = uint32_t(view_mip_);
+    vd.mipLevelCount = 1;
+    vd.baseArrayLayer = uint32_t(view_layer_);
+    vd.arrayLayerCount = (vd.dimension == WGPUTextureViewDimension_2DArray) ?
+                             uint32_t(std::max((type_ & GPU_TEXTURE_1D) ? h_ : d_, 1)) :
+                             1;
+    storage_view_ = wgpuTextureCreateView(texture_, &vd);
+  }
+  return storage_view_;
+}
+
 bool WebGPUTexture::init_internal(VertBuf * /*vbo*/)
 {
   /* Texture-from-buffer not implemented yet. */
@@ -220,57 +400,420 @@ bool WebGPUTexture::init_internal(VertBuf * /*vbo*/)
   return true;
 }
 
-bool WebGPUTexture::init_internal(gpu::Texture * /*src*/,
-                                  int /*mip_offset*/,
-                                  int /*layer_offset*/,
+bool WebGPUTexture::init_internal(gpu::Texture *src,
+                                  int mip_offset,
+                                  int layer_offset,
                                   bool /*use_stencil*/)
 {
-  /* Texture views onto another texture not implemented yet. */
+  /* Texture view: share the source's WGPUTexture, expose a WGPUTextureView
+   * covering this view's layer/mip window. Film::read_pass reads per-layer
+   * views of the accumulation textures, so reads must also work (read() offsets
+   * the copy origin by view_layer_). */
   wgpu_format_ = webgpu_texture_format(format_);
-  return true;
+  WebGPUTexture *s = static_cast<WebGPUTexture *>(src);
+  if (s == nullptr || s->texture_ == nullptr) {
+    /* Device-less / source not materialized: metadata-only, like init_internal. */
+    return true;
+  }
+  texture_ = s->texture_;
+  wgpuTextureAddRef(texture_);
+  is_view_ = true;
+  view_layer_ = std::max(layer_offset, 0);
+  view_mip_ = std::max(mip_offset, 0);
+
+  WGPUTextureViewDescriptor vd = {};
+  vd.format = wgpu_format_;
+  vd.dimension = (type_ & GPU_TEXTURE_3D)    ? WGPUTextureViewDimension_3D :
+                 (type_ & GPU_TEXTURE_CUBE)  ? WGPUTextureViewDimension_Cube :
+                 (type_ & GPU_TEXTURE_ARRAY) ? WGPUTextureViewDimension_2DArray :
+                                               WGPUTextureViewDimension_2D;
+  vd.baseMipLevel = uint32_t(view_mip_);
+  vd.mipLevelCount = uint32_t(std::max(mipmaps_, 1));
+  vd.baseArrayLayer = uint32_t(view_layer_);
+  vd.arrayLayerCount = (vd.dimension == WGPUTextureViewDimension_2DArray) ?
+                           uint32_t(std::max((type_ & GPU_TEXTURE_1D) ? h_ : d_, 1)) :
+                       (vd.dimension == WGPUTextureViewDimension_Cube) ? 6u : 1u;
+  view_ = wgpuTextureCreateView(texture_, &vd);
+  return view_ != nullptr;
 }
 
 void WebGPUTexture::update_sub(int mip,
                                int offset[3],
                                int extent[3],
-                               eGPUDataFormat /*format*/,
+                               eGPUDataFormat format,
                                const void *data,
-                               uint /*unpack_row_length*/)
+                               uint unpack_row_length)
 {
   WebGPUContext *ctx = ctx_get();
   if (!texture_ || !ctx || !ctx->queue() || !data) {
     return;
   }
+  if (is_depth_format()) {
+    /* WebGPU forbids writing the depth aspect via WriteTexture. */
+    static int s_depth_up = 0;
+    if (s_depth_up++ < 4) {
+      fprintf(stderr, "WGPU_TEX update_sub '%s': depth upload skipped\n", name_.c_str());
+      fflush(stderr);
+    }
+    return;
+  }
+  /* WriteTexture executes before later submits — don't let it retroactively
+   * change what an in-recording pass reads (same hazard as WriteBuffer). */
+  ctx->flush_if_pass_open("tex");
+
+  if (getenv("WGPU_LOG_TEXUP")) {
+    fprintf(stderr,
+            "WGPU_TEXUP '%s' tex=%dx%d up=%dx%dx%d off=%d,%d,%d mip=%d fmt=%d data_fmt=%d "
+            "rowlen=%u\n",
+            name_.c_str(),
+            w_, h_,
+            extent[0], extent[1], extent[2],
+            offset[0], offset[1], offset[2],
+            mip, int(wgpu_format_), int(format), unpack_row_length);
+    fflush(stderr);
+  }
+
+  const uint32_t bpp = webgpu_format_bytes_per_pixel(wgpu_format_);
+  const uint32_t w = uint32_t(std::max(extent[0], 1));
+  const uint32_t h = uint32_t(std::max(extent[1], 1));
+  const uint32_t d = uint32_t(std::max(extent[2], 1));
+  /* `format` is the SOURCE texel encoding, which need not match the texture's
+   * texel size (e.g. EEVEE's utility LUT/blue-noise tables upload float32 data
+   * into an RGBA16F array). Raw-copying mismatched data floods the texture with
+   * garbage — every stochastic decision downstream (gbuffer closure packing,
+   * light/shadow sampling) then peppers per-pixel. Convert/repack when needed. */
+  const size_t src_px = to_bytesize(format_, format);
+  const uint32_t src_row_px = (unpack_row_length != 0) ? unpack_row_length : w;
+
+  const void *upload = data;
+  void *tmp = nullptr;
+  if (src_px != bpp || src_row_px != w) {
+    const bool needs_convert = (src_px != bpp);
+    enum { CONV_NONE, CONV_F16, CONV_F32, CONV_11_11_10, CONV_10_10_10_2, CONV_UNORM8 } conv =
+        CONV_NONE;
+    if (needs_convert && format == GPU_DATA_FLOAT) {
+      switch (wgpu_format_) {
+        case WGPUTextureFormat_RGBA16Float:
+        case WGPUTextureFormat_RG16Float:
+        case WGPUTextureFormat_R16Float:
+          conv = CONV_F16;
+          break;
+        case WGPUTextureFormat_RGBA32Float:
+          conv = CONV_F32; /* Channel expansion only (RGB32F source). */
+          break;
+        case WGPUTextureFormat_RG11B10Ufloat:
+          conv = CONV_11_11_10;
+          break;
+        case WGPUTextureFormat_RGB10A2Unorm:
+          conv = CONV_10_10_10_2;
+          break;
+        case WGPUTextureFormat_RGBA8Unorm:
+        case WGPUTextureFormat_RGBA8UnormSrgb:
+        case WGPUTextureFormat_RG8Unorm:
+        case WGPUTextureFormat_R8Unorm:
+          conv = CONV_UNORM8;
+          break;
+        default:
+          break;
+      }
+    }
+    if (needs_convert && conv == CONV_NONE) {
+      static int s_conv_log = 0;
+      if (s_conv_log < 20) {
+        s_conv_log++;
+        fprintf(stderr,
+                "WGPU_TEX update_sub '%s': unsupported conversion data_fmt=%d src_px=%zu "
+                "tex_bpp=%u wgpu_fmt=%d (upload skipped)\n",
+                name_.c_str(),
+                int(format),
+                src_px,
+                bpp,
+                int(wgpu_format_));
+        fflush(stderr);
+      }
+      return;
+    }
+    /* Positive-only small unsigned floats: drop sign, truncate half mantissa. */
+    auto to_uf11 = [](float v) -> uint32_t {
+      uint16_t half = math::float_to_half(v > 0.0f ? v : 0.0f);
+      return uint32_t(half >> 4) & 0x7FFu;
+    };
+    auto to_uf10 = [](float v) -> uint32_t {
+      uint16_t half = math::float_to_half(v > 0.0f ? v : 0.0f);
+      return uint32_t(half >> 5) & 0x3FFu;
+    };
+    auto to_unorm = [](float v, uint32_t max) -> uint32_t {
+      v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+      return uint32_t(v * float(max) + 0.5f);
+    };
+    tmp = malloc(size_t(w) * h * d * bpp);
+    const uint8_t *src_bytes = static_cast<const uint8_t *>(data);
+    for (uint32_t row = 0; row < h * d; row++) {
+      const uint8_t *src_row = src_bytes + size_t(row) * src_row_px * src_px;
+      uint8_t *dst_row = static_cast<uint8_t *>(tmp) + size_t(row) * w * bpp;
+      const uint32_t src_ch = uint32_t(src_px / 4); /* float32 components */
+      switch (conv) {
+        case CONV_F16: {
+          const uint32_t dst_ch = bpp / 2;
+          if (src_ch == dst_ch) {
+            math::float_to_half_array(reinterpret_cast<const float *>(src_row),
+                                      reinterpret_cast<uint16_t *>(dst_row),
+                                      size_t(w) * dst_ch);
+          }
+          else {
+            /* Channel expansion (RGB source into padded RGBA texture — the
+             * OCIO LUTs): convert per texel, pad alpha with 1. */
+            const float *s = reinterpret_cast<const float *>(src_row);
+            uint16_t *d = reinterpret_cast<uint16_t *>(dst_row);
+            for (uint32_t x = 0; x < w; x++) {
+              for (uint32_t c = 0; c < dst_ch; c++) {
+                const float v = (c < src_ch) ? s[x * src_ch + c] : (c == 3 ? 1.0f : 0.0f);
+                d[x * dst_ch + c] = math::float_to_half(v);
+              }
+            }
+          }
+          break;
+        }
+        case CONV_F32: {
+          /* Float32 target with channel expansion. */
+          const uint32_t dst_ch = bpp / 4;
+          const float *s = reinterpret_cast<const float *>(src_row);
+          float *d = reinterpret_cast<float *>(dst_row);
+          for (uint32_t x = 0; x < w; x++) {
+            for (uint32_t c = 0; c < dst_ch; c++) {
+              d[x * dst_ch + c] = (c < src_ch) ? s[x * src_ch + c] : (c == 3 ? 1.0f : 0.0f);
+            }
+          }
+          break;
+        }
+        case CONV_11_11_10: {
+          const float *s = reinterpret_cast<const float *>(src_row);
+          uint32_t *dw = reinterpret_cast<uint32_t *>(dst_row);
+          for (uint32_t x = 0; x < w; x++, s += 3) {
+            dw[x] = to_uf11(s[0]) | (to_uf11(s[1]) << 11) | (to_uf10(s[2]) << 22);
+          }
+          break;
+        }
+        case CONV_10_10_10_2: {
+          const float *s = reinterpret_cast<const float *>(src_row);
+          uint32_t *dw = reinterpret_cast<uint32_t *>(dst_row);
+          for (uint32_t x = 0; x < w; x++, s += 4) {
+            dw[x] = to_unorm(s[0], 1023) | (to_unorm(s[1], 1023) << 10) |
+                    (to_unorm(s[2], 1023) << 20) | (to_unorm(s[3], 3) << 30);
+          }
+          break;
+        }
+        case CONV_UNORM8: {
+          const float *s = reinterpret_cast<const float *>(src_row);
+          const uint32_t dst_ch = bpp; /* 1 byte per component. */
+          if (src_ch == dst_ch) {
+            for (uint32_t x = 0; x < w * dst_ch; x++) {
+              dst_row[x] = uint8_t(to_unorm(s[x], 255));
+            }
+          }
+          else {
+            for (uint32_t x = 0; x < w; x++) {
+              for (uint32_t c = 0; c < dst_ch; c++) {
+                const float v = (c < src_ch) ? s[x * src_ch + c] : (c == 3 ? 1.0f : 0.0f);
+                dst_row[x * dst_ch + c] = uint8_t(to_unorm(v, 255));
+              }
+            }
+          }
+          break;
+        }
+        case CONV_NONE:
+          std::memcpy(dst_row, src_row, size_t(w) * bpp);
+          break;
+      }
+    }
+    upload = tmp;
+  }
+
   WGPUTexelCopyTextureInfo dst = {};
   dst.texture = texture_;
   dst.mipLevel = mip;
   dst.origin = {uint32_t(offset[0]), uint32_t(offset[1]), uint32_t(offset[2])};
-  const uint32_t bpp = webgpu_format_bytes_per_pixel(wgpu_format_);
   WGPUTexelCopyBufferLayout layout = {};
   layout.offset = 0;
-  layout.bytesPerRow = uint32_t(extent[0]) * bpp;
-  layout.rowsPerImage = uint32_t(extent[1]);
-  WGPUExtent3D wext = {uint32_t(extent[0]), uint32_t(extent[1]), uint32_t(std::max(extent[2], 1))};
-  const size_t byte_size = size_t(layout.bytesPerRow) * size_t(extent[1]) *
-                           size_t(std::max(extent[2], 1));
-  wgpuQueueWriteTexture(ctx->queue(), &dst, data, byte_size, &layout, &wext);
+  layout.bytesPerRow = w * bpp;
+  layout.rowsPerImage = h;
+  WGPUExtent3D wext = {w, h, d};
+  if (type_ & GPU_TEXTURE_1D) {
+    /* Promoted 1D: the source's second axis (extent[1]/offset[1]) is the layer
+     * axis; the memory layout (one w-texel row per layer) is unchanged. */
+    dst.origin = {uint32_t(offset[0]), 0, uint32_t(offset[1])};
+    wext = {w, 1, h};
+    layout.rowsPerImage = 1;
+  }
+  const size_t byte_size = size_t(w) * bpp * h * d;
+  wgpuQueueWriteTexture(ctx->queue(), &dst, upload, byte_size, &layout, &wext);
+  if (tmp) {
+    free(tmp);
+  }
 }
 
-void WebGPUTexture::copy_to(Texture * /*dst*/, IndexRange /*mip_levels*/)
+void WebGPUTexture::generate_mipmap()
 {
-  /* GPU texture-to-texture copy: TODO (command encoder CopyTextureToTexture). */
+  WebGPUContext *ctx = ctx_get();
+  if (ctx != nullptr) {
+    ctx->generate_mipmaps(this);
+  }
 }
 
-void WebGPUTexture::clear(const double4 /*data*/)
+void WebGPUTexture::copy_to(Texture *dst_tex, IndexRange mip_levels)
 {
-  /* Clear via a render pass / clear-buffer write: TODO. */
+  WebGPUTexture *dst = static_cast<WebGPUTexture *>(dst_tex);
+  WebGPUContext *ctx = ctx_get();
+  if (ctx == nullptr || texture_ == nullptr || dst == nullptr || dst->texture_ == nullptr) {
+    return;
+  }
+  /* Copies must not land inside an open pass, and must execute after any draws
+   * already recorded into it. */
+  ctx->render_pass_end();
+  WGPUCommandEncoder enc = ctx->ensure_encoder();
+  if (enc == nullptr) {
+    return;
+  }
+  const int layers = std::max(layer_count(), 1);
+  for (const int mip : mip_levels) {
+    WGPUTexelCopyTextureInfo src_info = {};
+    src_info.texture = texture_;
+    src_info.mipLevel = uint32_t(mip + view_mip_);
+    src_info.origin = {0, 0, uint32_t(view_layer_)};
+    WGPUTexelCopyTextureInfo dst_info = {};
+    dst_info.texture = dst->texture_;
+    dst_info.mipLevel = uint32_t(mip + dst->view_mip_);
+    dst_info.origin = {0, 0, uint32_t(dst->view_layer_)};
+    const uint32_t mw = std::max(w_ >> mip, 1);
+    const uint32_t mh = std::max(h_ >> mip, 1);
+    WGPUExtent3D ext = {mw, uint32_t(std::max(int(mh), 1)), uint32_t(layers)};
+    wgpuCommandEncoderCopyTextureToTexture(enc, &src_info, &dst_info, &ext);
+  }
+  ctx->flush_encoder();
 }
 
-void WebGPUTexture::read(int /*mip*/, eGPUDataFormat /*format*/, void * /*dst*/)
+void WebGPUTexture::clear(const double4 data)
 {
-  /* GPU→host readback needs an async buffer map; not wired yet. Caller owns the
-   * destination buffer; we don't know the per-format byte size here, so do
-   * nothing rather than risk overflowing dst. */
+  /* Clear via a render pass per layer (works for color and depth formats that
+   * carry RenderAttachment usage — Blender's pool textures do). Non-renderable
+   * textures fall back to a zero upload when clearing to zero. */
+  WebGPUContext *ctx = ctx_get();
+  if (ctx == nullptr || texture_ == nullptr || ctx->device() == nullptr) {
+    return;
+  }
+  const bool is_depth = is_depth_format();
+  const uint32_t usage = wgpuTextureGetUsage(texture_);
+  const bool is_3d = (type_ & GPU_TEXTURE_3D) != 0;
+  const int layers = is_3d ? 1 : std::max(d_, 1);
+  /* 3D textures cannot take 2D attachment views — a single invalid view POISONS
+   * the whole command buffer at submit (dropping every valid draw recorded with
+   * it). Route 3D clears through the upload path below. */
+  if (!is_3d && (usage & WGPUTextureUsage_RenderAttachment)) {
+    ctx->render_pass_end();
+    WGPUCommandEncoder enc = ctx->ensure_encoder();
+    if (enc == nullptr) {
+      return;
+    }
+    for (int l = 0; l < layers; l++) {
+      WGPUTextureView v = wgpu_attachment_view(l, 0);
+      if (v == nullptr) {
+        continue;
+      }
+      WGPURenderPassDescriptor desc = {};
+      WGPURenderPassColorAttachment ca = {};
+      WGPURenderPassDepthStencilAttachment da = {};
+      if (is_depth) {
+        da.view = v;
+        da.depthLoadOp = WGPULoadOp_Clear;
+        da.depthStoreOp = WGPUStoreOp_Store;
+        da.depthClearValue = float(data.x);
+        if (webgpu_format_has_stencil(wgpu_format_)) {
+          da.stencilLoadOp = WGPULoadOp_Clear;
+          da.stencilStoreOp = WGPUStoreOp_Store;
+          da.stencilClearValue = 0;
+        }
+        desc.depthStencilAttachment = &da;
+      }
+      else {
+        ca.view = v;
+        ca.depthSlice = WGPU_DEPTH_SLICE_UNDEFINED;
+        ca.loadOp = WGPULoadOp_Clear;
+        ca.storeOp = WGPUStoreOp_Store;
+        ca.clearValue = {data.x, data.y, data.z, data.w};
+        desc.colorAttachmentCount = 1;
+        desc.colorAttachments = &ca;
+      }
+      WGPURenderPassEncoder pass = wgpuCommandEncoderBeginRenderPass(enc, &desc);
+      if (pass) {
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+      }
+    }
+    return;
+  }
+  if (data.x == 0.0 && data.y == 0.0 && data.z == 0.0 && data.w == 0.0 && !is_depth &&
+      ctx->queue() != nullptr)
+  {
+    /* Zero-fill upload for non-renderable (and 3D) textures. */
+    const int depth_or_layers = std::max(d_, 1);
+    const uint32_t bpp = webgpu_format_bytes_per_pixel(wgpu_format_);
+    const size_t row = size_t(std::max(w_, 1)) * bpp;
+    std::vector<uint8_t> zeros(row * size_t(std::max(h_, 1)) * size_t(depth_or_layers), 0);
+    WGPUTexelCopyTextureInfo dst = {};
+    dst.texture = texture_;
+    WGPUTexelCopyBufferLayout layout = {};
+    layout.bytesPerRow = uint32_t(row);
+    layout.rowsPerImage = uint32_t(std::max(h_, 1));
+    WGPUExtent3D ext = {
+        uint32_t(std::max(w_, 1)), uint32_t(std::max(h_, 1)), uint32_t(depth_or_layers)};
+    wgpuQueueWriteTexture(ctx->queue(), &dst, zeros.data(), zeros.size(), &layout, &ext);
+    return;
+  }
+  static int s_unimpl_logged = 0;
+  if (s_unimpl_logged < 8) {
+    s_unimpl_logged++;
+    fprintf(stderr, "WGPU_TEX clear unimplemented for fmt=%d usage=0x%x\n", int(wgpu_format_),
+            usage);
+    fflush(stderr);
+  }
+}
+
+void WebGPUTexture::read(int /*mip*/, eGPUDataFormat format, void *dst)
+{
+  WebGPUContext *ctx = ctx_get();
+  if (ctx == nullptr || texture_ == nullptr || dst == nullptr) {
+    return;
+  }
+  /* Channel count of the destination matches the texture's component count. */
+  int channels = 4;
+  switch (wgpu_format_) {
+    case WGPUTextureFormat_R8Unorm:
+    case WGPUTextureFormat_R8Uint:
+    case WGPUTextureFormat_R16Float:
+    case WGPUTextureFormat_R16Uint:
+    case WGPUTextureFormat_R32Float:
+    case WGPUTextureFormat_R32Uint:
+    case WGPUTextureFormat_R32Sint:
+      channels = 1; break;
+    case WGPUTextureFormat_RG8Unorm:
+    case WGPUTextureFormat_RG16Float:
+    case WGPUTextureFormat_RG32Float:
+    case WGPUTextureFormat_RG32Uint:
+      channels = 2; break;
+    default:
+      channels = 4; break;
+  }
+  ctx->read_color_sync(texture_,
+                       wgpu_format_,
+                       0,
+                       0,
+                       width_get(),
+                       height_get(),
+                       format,
+                       channels,
+                       dst,
+                       view_layer_,
+                       view_mip_);
 }
 
 }  // namespace blender::gpu

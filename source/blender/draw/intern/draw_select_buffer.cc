@@ -13,6 +13,8 @@
 #include "BLI_math_matrix.hh"
 #include "MEM_guardedalloc.h"
 
+#include "BLI_array.hh"
+#include "ED_view3d.hh"
 #include "BLI_array_utils_c.hh"
 #include "BLI_bitmap.hh"
 #include "BLI_bitmap_draw_2d.hh"
@@ -35,6 +37,11 @@
 #include "DRW_select_buffer.hh"
 
 #include "../engines/select/select_engine.hh"
+
+#ifdef __EMSCRIPTEN__
+#  include "BKE_editmesh.hh"
+#  include "bmesh.hh"
+#endif
 
 namespace blender {
 
@@ -63,6 +70,181 @@ bool SELECTID_Context::is_dirty(Depsgraph *depsgraph, RegionView3D *rv3d)
 /* -------------------------------------------------------------------- */
 /** \name Buffer of select ID's
  * \{ */
+
+#ifdef __EMSCRIPTEN__
+/* The WebGPU backend cannot read the select-id texture back synchronously (no
+ * JSPI): GPU_framebuffer_read_color returns zeros and edit-mode element picking
+ * would select nothing. Rasterize the ids on the CPU into `buf` instead:
+ * project each BMesh element with the region's perspective matrix and splat its
+ * select id, in the engine's priority order (faces, then edges, then verts, so
+ * verts win ties like the real id pass). No occlusion — hidden elements are
+ * pickable, matching x-ray select-through behavior. */
+static void select_buffer_cpu_fallback(SELECTID_Context *select_ctx,
+                                       ARegion *region,
+                                       View3D *v3d,
+                                       const rcti *rect,
+                                       uint *buf)
+{
+  RegionView3D *rv3d = static_cast<RegionView3D *>(region->regiondata);
+  const float4x4 persmat(rv3d->persmat);
+  const int rect_w = BLI_rcti_size_x(rect);
+  const int rect_h = BLI_rcti_size_y(rect);
+  const float2 half_size(region->winx * 0.5f, region->winy * 0.5f);
+
+  /* Project a local-space point to region pixels (+ NDC depth); false when
+   * behind the eye. */
+  auto project = [&](const float4x4 &obmat, const float3 &co, float3 &r_px) {
+    const float4 hp = persmat * (obmat * float4(co, 1.0f));
+    if (hp.w < 1e-6f) {
+      return false;
+    }
+    r_px = float3((float2(hp.x, hp.y) / hp.w + 1.0f) * half_size, hp.z / hp.w);
+    return true;
+  };
+
+  /* Occlusion: rasterize the (fan-triangulated) faces' NDC depth into a
+   * z-buffer, then depth-test the element splats — the GPU id pass does the
+   * same with a real depth buffer. X-ray shading keeps select-through. */
+  const bool use_occlusion = (v3d == nullptr) ? true :
+                                                !SHADING_XRAY_FLAG_ENABLED(v3d->shading);
+  blender::Array<float> zbuf;
+  if (use_occlusion) {
+    zbuf = blender::Array<float>(size_t(rect_w) * rect_h, FLT_MAX);
+    auto raster_tri = [&](const float3 &a, const float3 &b, const float3 &c) {
+      const float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+      if (fabsf(area) < 1e-9f) {
+        return;
+      }
+      /* Polygon-offset style bias: one pixel of z slope + constant. */
+      const float dzdx = ((b.z - a.z) * (c.y - a.y) - (c.z - a.z) * (b.y - a.y)) / area;
+      const float dzdy = ((c.z - a.z) * (b.x - a.x) - (b.z - a.z) * (c.x - a.x)) / area;
+      const float bias = fabsf(dzdx) + fabsf(dzdy) + 1e-4f;
+      const int x0 = std::max(int(floorf(std::min({a.x, b.x, c.x}))) - rect->xmin, 0);
+      const int x1 = std::min(int(ceilf(std::max({a.x, b.x, c.x}))) - rect->xmin, rect_w - 1);
+      const int y0 = std::max(int(floorf(std::min({a.y, b.y, c.y}))) - rect->ymin, 0);
+      const int y1 = std::min(int(ceilf(std::max({a.y, b.y, c.y}))) - rect->ymin, rect_h - 1);
+      const float inv_area = 1.0f / area;
+      for (int y = y0; y <= y1; y++) {
+        for (int x = x0; x <= x1; x++) {
+          const float px = float(x + rect->xmin) + 0.5f;
+          const float py = float(y + rect->ymin) + 0.5f;
+          const float w0 = ((b.x - px) * (c.y - py) - (b.y - py) * (c.x - px)) * inv_area;
+          const float w1 = ((c.x - px) * (a.y - py) - (c.y - py) * (a.x - px)) * inv_area;
+          const float w2 = 1.0f - w0 - w1;
+          if (w0 < 0.0f || w1 < 0.0f || w2 < 0.0f) {
+            continue;
+          }
+          const float z = w0 * a.z + w1 * b.z + w2 * c.z + bias;
+          float &zb = zbuf[size_t(y) * rect_w + x];
+          zb = std::min(zb, z);
+        }
+      }
+    };
+    for (Object *ob : select_ctx->objects) {
+      BMEditMesh *em_z = BKE_editmesh_from_object(ob);
+      if (em_z == nullptr || em_z->bm == nullptr) {
+        continue;
+      }
+      const float4x4 obmat = float4x4(ob->object_to_world());
+      BMFace *f;
+      BMIter iter;
+      BM_ITER_MESH (f, &iter, em_z->bm, BM_FACES_OF_MESH) {
+        if (BM_elem_flag_test(f, BM_ELEM_HIDDEN)) {
+          continue;
+        }
+        BMLoop *l_first = BM_FACE_FIRST_LOOP(f);
+        float3 p0;
+        if (!project(obmat, l_first->v->co, p0)) {
+          continue; /* Crosses the near plane: conservatively occludes nothing. */
+        }
+        for (BMLoop *l = l_first->next; l->next != l_first; l = l->next) {
+          float3 p1, p2;
+          if (project(obmat, l->v->co, p1) && project(obmat, l->next->v->co, p2)) {
+            raster_tri(p0, p1, p2);
+          }
+        }
+      }
+    }
+  }
+
+  auto splat = [&](const float3 &px, uint id) {
+    const int x = int(px.x) - rect->xmin;
+    const int y = int(px.y) - rect->ymin;
+    if (x >= 0 && x < rect_w && y >= 0 && y < rect_h) {
+      if (use_occlusion && px.z > zbuf[size_t(y) * rect_w + x]) {
+        return; /* Hidden behind a face. */
+      }
+      buf[y * rect_w + x] = id;
+    }
+  };
+
+  for (Object *ob : select_ctx->objects) {
+    BMEditMesh *em = BKE_editmesh_from_object(ob);
+    if (em == nullptr || em->bm == nullptr) {
+      continue;
+    }
+    BMesh *bm = em->bm;
+    const ElemIndexRanges ranges = select_ctx->elem_ranges.lookup_default(ob, ElemIndexRanges{});
+    const float4x4 obmat = float4x4(ob->object_to_world());
+    BMIter iter;
+
+    if ((select_ctx->select_mode & SCE_SELECT_FACE) && !ranges.face.is_empty()) {
+      BMFace *f;
+      int i = 0;
+      BM_ITER_MESH_INDEX (f, &iter, bm, BM_FACES_OF_MESH, i) {
+        if (BM_elem_flag_test(f, BM_ELEM_HIDDEN)) {
+          continue;
+        }
+        float3 center;
+        BM_face_calc_center_median(f, center);
+        float3 px;
+        if (project(obmat, center, px)) {
+          /* Small disk so face clicks don't need to hit the exact center px. */
+          const uint id = uint(ranges.face.start()) + uint(i);
+          for (int dy = -3; dy <= 3; dy++) {
+            for (int dx = -3; dx <= 3; dx++) {
+              if (dx * dx + dy * dy <= 9) {
+                splat(px + float3(float(dx), float(dy), 0.0f), id);
+              }
+            }
+          }
+        }
+      }
+    }
+    if ((select_ctx->select_mode & SCE_SELECT_EDGE) && !ranges.edge.is_empty()) {
+      BMEdge *e;
+      int i = 0;
+      BM_ITER_MESH_INDEX (e, &iter, bm, BM_EDGES_OF_MESH, i) {
+        if (BM_elem_flag_test(e, BM_ELEM_HIDDEN)) {
+          continue;
+        }
+        float3 p0, p1;
+        if (project(obmat, e->v1->co, p0) && project(obmat, e->v2->co, p1)) {
+          const uint id = uint(ranges.edge.start()) + uint(i);
+          const float len = math::distance(p0.xy(), p1.xy());
+          const int steps = math::clamp(int(len), 1, 512);
+          for (int s = 0; s <= steps; s++) {
+            splat(math::interpolate(p0, p1, float(s) / steps), id);
+          }
+        }
+      }
+    }
+    if ((select_ctx->select_mode & SCE_SELECT_VERTEX) && !ranges.vert.is_empty()) {
+      BMVert *v;
+      int i = 0;
+      BM_ITER_MESH_INDEX (v, &iter, bm, BM_VERTS_OF_MESH, i) {
+        if (BM_elem_flag_test(v, BM_ELEM_HIDDEN)) {
+          continue;
+        }
+        float3 px;
+        if (project(obmat, v->co, px)) {
+          splat(px, uint(ranges.vert.start()) + uint(i));
+        }
+      }
+    }
+  }
+}
+#endif
 
 uint *DRW_select_buffer_read(
     Depsgraph *depsgraph, ARegion *region, View3D *v3d, const rcti *rect, uint *r_buf_len)
@@ -115,6 +297,13 @@ uint *DRW_select_buffer_read(
         /* The rect has been clamped so we need to realign the buffer and fill in the blanks */
         GPU_select_buffer_stride_realign(rect, &rect_clamp, buf);
       }
+
+#ifdef __EMSCRIPTEN__
+      /* The GPU read above returned zeros (deferred readback) — rasterize the
+       * ids on the CPU so edit-mode picking works. */
+      memset(buf, 0, sizeof(uint) * buf_len);
+      select_buffer_cpu_fallback(select_ctx, region, v3d, rect, buf);
+#endif
     }
 
     GPU_framebuffer_restore();

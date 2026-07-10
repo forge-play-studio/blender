@@ -675,6 +675,11 @@ static GHOST_TDrawingContextType ghost_context_type()
     case GPU_BACKEND_METAL:
       return GHOST_kDrawingContextTypeMetal;
 #endif
+#ifdef WITH_WEBGPU_BACKEND
+    case GPU_BACKEND_WEBGPU:
+      /* The device lives outside GHOST; windows/contexts use the None type. */
+      return GHOST_kDrawingContextTypeNone;
+#endif
     default:
       BLI_assert_unreachable();
       return GHOST_kDrawingContextTypeNone;

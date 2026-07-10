@@ -22,6 +22,8 @@
 
 namespace blender::gpu {
 
+class WebGPUContext;
+
 class WebGPUVertexBuffer : public VertBuf {
  private:
   WGPUBuffer buffer_ = nullptr;
@@ -38,6 +40,13 @@ class WebGPUVertexBuffer : public VertBuf {
 
   WGPUBuffer wgpu_buffer()
   {
+    /* Flush pending CPU data to the GPU before use — draws pull buffers via this
+     * accessor and nothing else triggers VertBuf::upload() on this backend.
+     * Without this the WGPUBuffer exists but holds zeros (degenerate geometry,
+     * no fragments rasterized anywhere). */
+    if (flag & GPU_VERTBUF_DATA_DIRTY) {
+      this->upload();
+    }
     ensure_buffer();
     return buffer_;
   }
@@ -50,6 +59,8 @@ class WebGPUVertexBuffer : public VertBuf {
 
  private:
   void ensure_buffer();
+  /* Swap in a fresh WGPUBuffer when updating while a pass records (see impl). */
+  bool cow_if_pass_open(WebGPUContext *ctx);
 };
 
 }  // namespace blender::gpu

@@ -15,6 +15,9 @@ namespace blender::gpu {
 
 WebGPUVertexBuffer::~WebGPUVertexBuffer()
 {
+  if (WebGPUContext *ctx = static_cast<WebGPUContext *>(Context::get())) {
+    ctx->scrub_buffer(buffer_);
+  }
   if (buffer_) {
     wgpuBufferRelease(buffer_);
   }
@@ -72,12 +75,37 @@ void WebGPUVertexBuffer::ensure_buffer()
   buffer_ = wgpuDeviceCreateBuffer(ctx->device(), &desc);
 }
 
+/* Copy-on-write: updating a live buffer while a pass is recording would either
+ * retroactively change what earlier draws read (queue writes execute before the
+ * pass's submit) or force a full submit per update (pathological — BLF text
+ * updates a VBO per run). A fresh buffer isolates the recorded draws: the pass
+ * encoder holds refs to the old one. Requires the CPU shadow (full contents). */
+bool WebGPUVertexBuffer::cow_if_pass_open(WebGPUContext *ctx)
+{
+  if (!ctx->pass_open() || buffer_ == nullptr || data_ == nullptr) {
+    return false;
+  }
+  WGPUBufferDescriptor desc = {};
+  desc.size = buffer_size_;
+  desc.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst | WGPUBufferUsage_Storage |
+               WGPUBufferUsage_CopySrc;
+  WGPUBuffer fresh = wgpuDeviceCreateBuffer(ctx->device(), &desc);
+  if (fresh == nullptr) {
+    return false;
+  }
+  ctx->rebind_buffer(buffer_, fresh); /* VBOs can be bound as SSBOs. */
+  wgpuBufferRelease(buffer_);
+  buffer_ = fresh;
+  return true;
+}
+
 void WebGPUVertexBuffer::upload_data()
 {
   ensure_buffer();
   WebGPUContext *ctx = WebGPUContext::get();
   if (buffer_ && ctx && ctx->queue() && data_) {
     const size_t used = this->size_used_get();
+    cow_if_pass_open(ctx);
     wgpuQueueWriteBuffer(ctx->queue(), buffer_, 0, data_, (used + 3) & ~size_t(3));
   }
 }
@@ -90,7 +118,16 @@ void WebGPUVertexBuffer::update_sub(uint start, uint len, const void *data)
   ensure_buffer();
   WebGPUContext *ctx = WebGPUContext::get();
   if (buffer_ && ctx && ctx->queue()) {
-    wgpuQueueWriteBuffer(ctx->queue(), buffer_, start, data, (len + 3) & ~size_t(3));
+    if (cow_if_pass_open(ctx)) {
+      /* Fresh buffer: upload the FULL shadow (it includes this sub-range). */
+      wgpuQueueWriteBuffer(
+          ctx->queue(), buffer_, 0, data_, (this->size_used_get() + 3) & ~size_t(3));
+    }
+    else {
+      /* No shadow to rebuild from: preserve GL ordering the expensive way. */
+      ctx->flush_if_pass_open("vbo_sub");
+      wgpuQueueWriteBuffer(ctx->queue(), buffer_, start, data, (len + 3) & ~size_t(3));
+    }
   }
 }
 

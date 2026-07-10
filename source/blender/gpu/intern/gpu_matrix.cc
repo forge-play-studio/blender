@@ -7,6 +7,7 @@
  */
 
 #include "gpu_context_private.hh"
+#include <cstdio>
 #include "gpu_matrix_private.hh"
 
 #define SUPPRESS_GENERIC_MATRIX_API
@@ -117,9 +118,30 @@ static void checkmat(cosnt float *m)
 
 #endif
 
+/* The stack `top` is UNSIGNED: with asserts compiled out, one unbalanced pop
+ * wraps it to ~4 billion and the next stack access corrupts memory far out of
+ * bounds (this froze the web build: the aborted Preferences window-open left an
+ * unbalanced pop, and the NEXT frame's first wmOrtho2 crashed the wasm heap).
+ * Clamp in release builds and complain loudly instead. */
+static bool gpu_matrix_stack_guard(uint &top, const bool is_push, const char *name)
+{
+  if (is_push && top + 1 >= MATRIX_STACK_DEPTH) {
+    fprintf(stderr, "GPU_matrix: %s stack OVERFLOW (unbalanced push)\n", name);
+    return false;
+  }
+  if (!is_push && top == 0) {
+    fprintf(stderr, "GPU_matrix: %s stack UNDERFLOW (unbalanced pop)\n", name);
+    return false;
+  }
+  return true;
+}
+
 void GPU_matrix_push()
 {
   BLI_assert(ModelViewStack.top + 1 < MATRIX_STACK_DEPTH);
+  if (!gpu_matrix_stack_guard(ModelViewStack.top, true, "ModelView")) {
+    return;
+  }
   ModelViewStack.top++;
   copy_m4_m4(ModelView, ModelViewStack.stack[ModelViewStack.top - 1]);
 }
@@ -127,6 +149,9 @@ void GPU_matrix_push()
 void GPU_matrix_pop()
 {
   BLI_assert(ModelViewStack.top > 0);
+  if (!gpu_matrix_stack_guard(ModelViewStack.top, false, "ModelView")) {
+    return;
+  }
   ModelViewStack.top--;
   gpu_matrix_state_active_set_dirty(true);
 }
@@ -134,6 +159,9 @@ void GPU_matrix_pop()
 void GPU_matrix_push_projection()
 {
   BLI_assert(ProjectionStack.top + 1 < MATRIX_STACK_DEPTH);
+  if (!gpu_matrix_stack_guard(ProjectionStack.top, true, "Projection")) {
+    return;
+  }
   ProjectionStack.top++;
   copy_m4_m4(Projection, ProjectionStack.stack[ProjectionStack.top - 1]);
 }
@@ -141,6 +169,9 @@ void GPU_matrix_push_projection()
 void GPU_matrix_pop_projection()
 {
   BLI_assert(ProjectionStack.top > 0);
+  if (!gpu_matrix_stack_guard(ProjectionStack.top, false, "Projection")) {
+    return;
+  }
   ProjectionStack.top--;
   gpu_matrix_state_active_set_dirty(true);
 }
@@ -399,6 +430,28 @@ static void mat4_look_from_origin(float m[4][4], float lookdir[3], float camup[3
 
 void GPU_matrix_ortho_set(float left, float right, float bottom, float top, float near, float far)
 {
+  {
+    /* Diagnose + recover from corrupted matrix state (web build: crashed here
+     * one frame after opening Preferences with a garbage stack index). */
+    Context *ctx = Context::get();
+    GPUMatrixState *state = ctx ? ctx->matrix_state : nullptr;
+    if (state == nullptr || state->projection_stack.top >= uint(MATRIX_STACK_DEPTH) ||
+        state->model_view_stack.top >= uint(MATRIX_STACK_DEPTH))
+    {
+      fprintf(stderr,
+              "GPU_matrix CORRUPT ctx=%p state=%p proj_top=%u mv_top=%u\n",
+              (void *)ctx,
+              (void *)state,
+              state ? state->projection_stack.top : 0xdeadu,
+              state ? state->model_view_stack.top : 0xdeadu);
+      fflush(stderr);
+      if (state == nullptr) {
+        return;
+      }
+      state->projection_stack.top = 0;
+      state->model_view_stack.top = 0;
+    }
+  }
   mat4_ortho_set(Projection, left, right, bottom, top, near, far);
   CHECKMAT(Projection);
   gpu_matrix_state_active_set_dirty(true);

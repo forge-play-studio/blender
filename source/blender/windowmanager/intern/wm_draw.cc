@@ -976,6 +976,22 @@ static void wm_draw_area_offscreen(bContext *C, wmWindow *win, ScrArea *area, bo
   CTX_wm_area_set(C, area);
   GPU_debug_group_begin(wm_area_name(area));
 
+#ifdef __EMSCRIPTEN__
+  {
+    static int s_area_log = 0;
+    /* Common layout spaces spam; only log the interesting ones. */
+    const bool interesting = !ELEM(area->spacetype, 1, 3, 4, 12, 21, 22);
+    if (interesting && s_area_log < 200) {
+      s_area_log++;
+      fprintf(stderr,
+              "WM_AREA_OFF space=%d gpuctx=%p\n",
+              int(area->spacetype),
+              (void *)GPU_context_active_get());
+      fflush(stderr);
+    }
+  }
+#endif
+
   /* Compute UI layouts for dynamically size regions. */
   for (ARegion &region : area->regionbase) {
     if (region.flag & RGN_FLAG_POLL_FAILED) {

@@ -113,12 +113,20 @@ void surf_shadow([[resource_table]] PipelineConstants &pipe,
    * This is equivalent of calling `next_after`, but without the safety. */
   u_depth += 2;
 
+#ifdef GPU_WEBGPU
+  /* WGSL has no image atomics (Tint ICEs on OpImageTexelPointer). Plain store:
+   * overlapping fragments of the same page pick an arbitrary depth instead of
+   * the minimum — a mild self-shadowing bias, acceptable until a
+   * storage-buffer-backed atlas redesign. */
+  imageStore(srt.shadow_atlas_img, out_texel, uint4(u_depth));
+#else
   if (uni.uniform_buf.shadow.use_debug_cost) {
     imageAtomicAdd(srt.shadow_atlas_img, out_texel, 1u);
   }
   else {
     imageAtomicMin(srt.shadow_atlas_img, out_texel, u_depth);
   }
+#endif
 }
 
 }  // namespace eevee

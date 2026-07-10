@@ -524,6 +524,24 @@ static void wm_init_userdef(Main *bmain)
   BKE_addon_remove_safe(&U.addons, "cycles");
 #endif
 
+#ifdef __EMSCRIPTEN__
+  /* The web GHOST backend is single-window (one canvas): anything configured to
+   * open a NEW OS window (Preferences, file browser, F12 render result) would
+   * silently fail. Route them all into temp fullscreen areas / the image editor
+   * inside the main window. Runs after every userdef load so saved prefs can't
+   * regress it. */
+  U.render_display_type = USER_RENDER_DISPLAY_SCREEN;
+  /* The earlier temp-fullscreen crash was the stale-GPU-context bug fixed in
+   * wm_window_make_drawable (ctx_stale) — fullscreen temp areas are safe now
+   * and the only way these editors can open on a single-window platform. */
+  U.filebrowser_display_type = USER_TEMP_SPACE_DISPLAY_FULLSCREEN;
+  U.preferences_display_type = USER_TEMP_SPACE_DISPLAY_FULLSCREEN;
+  /* Blend-save thumbnails render offscreen then READ BACK synchronously —
+   * blocking the browser main thread deadlocks (the async map callback can
+   * never run). Save without previews. */
+  U.file_preview_type = USER_FILE_PREVIEW_NONE;
+#endif
+
   ui::init_userdef();
 
   /* Needed so loading a file from the command line respects user-pref #26156. */

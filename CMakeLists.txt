@@ -340,6 +340,12 @@ Enable building Blender against SDL for windowing rather than the native APIs"
 )
 mark_as_advanced(WITH_GHOST_SDL)
 
+option(WITH_GHOST_WEB "\
+Enable the browser (Emscripten) windowing backend (canvas + html5 events)"
+  OFF
+)
+mark_as_advanced(WITH_GHOST_WEB)
+
 if(UNIX AND NOT (APPLE OR HAIKU))
   option(WITH_GHOST_X11 "Enable building Blender against X11 for windowing" ON)
   mark_as_advanced(WITH_GHOST_X11)

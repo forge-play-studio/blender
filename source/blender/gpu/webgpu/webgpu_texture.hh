@@ -15,6 +15,8 @@
 
 #include "gpu_texture_private.hh"
 
+#include <map>
+
 #include <webgpu/webgpu.h>
 
 namespace blender::gpu {
@@ -24,6 +26,18 @@ class WebGPUTexture : public Texture {
   WGPUTexture texture_ = nullptr;
   WGPUTextureView view_ = nullptr;
   WGPUTextureFormat wgpu_format_ = WGPUTextureFormat_RGBA8Unorm;
+  /* Single-layer/mip views for render attachments (key: layer<<8 | mip) and the
+   * depth-only view used when a depth-stencil texture is bound for sampling
+   * (WebGPU forbids multi-aspect views in texture bindings). */
+  std::map<uint32_t, WGPUTextureView> attachment_views_;
+  WGPUTextureView sample_view_ = nullptr;
+  WGPUTextureView storage_view_ = nullptr;
+  /* Set when this texture is a view onto another texture's WGPUTexture (which
+   * it then only references, never destroys). Reads/attachments offset into the
+   * shared texture by view_layer_/view_mip_. */
+  bool is_view_ = false;
+  int view_layer_ = 0;
+  int view_mip_ = 0;
 
  public:
   WebGPUTexture(const char *name);
@@ -42,7 +56,7 @@ class WebGPUTexture : public Texture {
   {
   }
 
-  void generate_mipmap() override {}
+  void generate_mipmap() override;
   void copy_to(Texture *dst, IndexRange mip_levels) override;
   void clear(const double4 data) override;
   void swizzle_set(const char /*swizzle_mask*/[4]) override {}
@@ -56,6 +70,36 @@ class WebGPUTexture : public Texture {
   WGPUTextureView wgpu_view() const
   {
     return view_;
+  }
+  /* View for use as a render-pass attachment: a single mip of a single layer
+   * (WebGPU render attachments must have exactly one layer). layer < 0 = 0. */
+  WGPUTextureView wgpu_attachment_view(int layer, int mip);
+  /* View for use in a sampled-texture binding: depth-only aspect for
+   * depth-stencil formats, the default whole-texture view otherwise. */
+  WGPUTextureView wgpu_sample_view();
+  /* Create a view of `other` (same size/format/mip layout as this texture's
+   * base) using THIS texture object's sampled-view window (mip/layer offsets,
+   * dimension). Used to sample snapshot copies. Caller owns the view. */
+  WGPUTextureView make_view_of(WGPUTexture other);
+  /* View for use in a storage-texture binding: WebGPU requires exactly one mip
+   * level there (the default view spans all mips). All layers included. */
+  WGPUTextureView wgpu_storage_view();
+  bool is_depth_format() const
+  {
+    switch (wgpu_format_) {
+      case WGPUTextureFormat_Depth16Unorm:
+      case WGPUTextureFormat_Depth24Plus:
+      case WGPUTextureFormat_Depth24PlusStencil8:
+      case WGPUTextureFormat_Depth32Float:
+      case WGPUTextureFormat_Depth32FloatStencil8:
+        return true;
+      default:
+        return false;
+    }
+  }
+  WGPUTextureFormat wgpu_format() const
+  {
+    return wgpu_format_;
   }
 
  protected:

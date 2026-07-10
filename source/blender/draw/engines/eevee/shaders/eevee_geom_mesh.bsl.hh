@@ -112,6 +112,20 @@ struct GeomMeshVertIn {
   }
 
   out_position = reverse_z::transform(view.point_view_to_homogenous(vs_P));
+
+#ifdef GPU_WEBGPU
+  /* Emulate gl_ViewportIndex (absent in WebGPU). All shadow viewports anchor at
+   * (0, 0) with size (min(1 << index, SHADOW_TILEMAP_RES) pages)^2, so the
+   * viewport transform reduces to scaling NDC toward the viewport corner of the
+   * full render target. Spill outside the intended rect resolves to invalid
+   * render-map pages and is dropped by imageStore bounds checks. */
+  if (pipe.is_shadow_pipe) [[static_branch]] {
+    float vp_scale = float(min(1 << out_viewport, SHADOW_TILEMAP_RES)) /
+                     float(SHADOW_TILEMAP_RES);
+    out_position.x = out_position.x * vp_scale + out_position.w * (vp_scale - 1.0f);
+    out_position.y = out_position.y * vp_scale + out_position.w * (vp_scale - 1.0f);
+  }
+#endif
 }
 
 }  // namespace eevee

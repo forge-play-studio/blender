@@ -42,7 +42,50 @@
 
 #include <webgpu/webgpu.h>
 
+#include "gpu_query.hh"
+
 namespace blender::gpu {
+
+/* Real WebGPU occlusion queries with ONE-ROUND-STALE results: the async resolve
+ * of round N is served to round N+1 (get_occlusion_result is synchronous but
+ * mapping is not). Gizmo highlight re-queries on every cursor move, so the lag
+ * is one mouse event — this is what makes gizmo hover/drag functional. */
+class WebGPUQueryPool : public QueryPool {
+ private:
+  int query_count_ = 0;
+
+ public:
+  void init(GPUQueryType /*type*/) override
+  {
+    query_count_ = 0;
+    if (WebGPUContext *ctx = WebGPUContext::get()) {
+      ctx->occlusion_pool_begin(256);
+    }
+  }
+  void begin_query() override
+  {
+    if (WebGPUContext *ctx = WebGPUContext::get()) {
+      ctx->occlusion_query_begin(query_count_);
+    }
+    query_count_++;
+  }
+  void end_query() override
+  {
+    if (WebGPUContext *ctx = WebGPUContext::get()) {
+      ctx->occlusion_query_end();
+    }
+  }
+  void get_occlusion_result(MutableSpan<uint32_t> r_values) override
+  {
+    for (uint32_t &v : r_values) {
+      v = 0;
+    }
+    if (WebGPUContext *ctx = WebGPUContext::get()) {
+      ctx->occlusion_pool_read(uint32_t(std::min<int64_t>(r_values.size(), query_count_)),
+                               r_values.data());
+    }
+  }
+};
 
 class WebGPUBackend : public GPUBackend {
  private:
@@ -77,6 +120,9 @@ class WebGPUBackend : public GPUBackend {
      * the main thread (which corrupted the heap), and sidesteps WebGPU device
      * sharing across worker threads — neither is wired for wasm yet. */
     GCaps.use_main_context_workaround = true;
+    /* WebGPU has no snorm 10_10_10_2 vertex format; make mesh extraction emit
+     * I16 (Snorm16x4) normals instead (same workaround as old AMD GL drivers). */
+    GCaps.use_hq_normals_workaround = true;
 
     /* WebGPU device capabilities. The device is created later (in the context),
      * so we cannot query it here; use values matching Dawn's common per-stage
@@ -86,8 +132,8 @@ class WebGPUBackend : public GPUBackend {
     GCaps.max_texture_size = 8192;
     GCaps.max_texture_3d_size = 2048;
     GCaps.max_texture_layers = 256;
-    GCaps.max_textures = 16;        /* maxSampledTexturesPerShaderStage */
-    GCaps.max_images = 8;           /* maxStorageTexturesPerShaderStage */
+    GCaps.max_textures = 32;        /* Blender slot space (bind tables are 32-wide) */
+    GCaps.max_images = 16;          /* Blender slot space */
     GCaps.max_work_group_count[0] = 65535;
     GCaps.max_work_group_count[1] = 65535;
     GCaps.max_work_group_count[2] = 65535;
@@ -127,7 +173,7 @@ class WebGPUBackend : public GPUBackend {
     WebGPUContext *ctx = WebGPUContext::get();
     {
       static int s_disp_entry = 0;
-      if (s_disp_entry < 12) {
+      if (s_disp_entry < 8) {
         WebGPUShader *es = ctx ? static_cast<WebGPUShader *>(ctx->shader) : nullptr;
         fprintf(stderr,
                 "WGPU_DISPATCH entry #%d ctx=%p dev=%p shader=%p cmod=%p\n",
@@ -146,17 +192,35 @@ class WebGPUBackend : public GPUBackend {
     if (sh == nullptr || !sh->is_valid() || sh->compute_module() == nullptr ||
         sh->interface == nullptr)
     {
+      static int s_skip_logged = 0;
+      if (sh && s_skip_logged < 200) {
+        s_skip_logged++;
+        fprintf(stderr,
+                "WGPU_DISPATCH skipped '%s' valid=%d cmod=%p iface=%p\n",
+                sh->name_get().c_str(),
+                int(sh->is_valid()),
+                (void *)sh->compute_module(),
+                (void *)sh->interface);
+        fflush(stderr);
+      }
       return;
     }
-    const uint64_t key = uint64_t(uintptr_t(sh));
+    const uint64_t key = uint64_t(uintptr_t(sh)) ^ sh->spec_hash();
     WGPUComputePipeline pipe = ctx->compute_pipeline_get(key);
     if (pipe == nullptr) {
-      WGPUBindGroupLayout bgl_explicit = ctx->make_bind_group_layout(sh->compute_bindings(), true);
+      WGPUBindGroupLayout bgl_explicit = ctx->make_bind_group_layout(
+          sh->compute_bindings(), true, sh->interface);
       WGPUPipelineLayout pipe_layout = ctx->make_pipeline_layout(bgl_explicit);
       WGPUComputePipelineDescriptor d = {};
+      /* Label = shader name so Dawn validation errors are attributable. */
+      d.label = {sh->name_get().c_str(), WGPU_STRLEN};
       d.layout = pipe_layout;
       d.compute.module = sh->compute_module();
       d.compute.entryPoint = {"main", WGPU_STRLEN};
+      std::vector<WGPUConstantEntry> spec_consts;
+      sh->spec_entries(sh->compute_wgsl(), spec_consts);
+      d.compute.constantCount = spec_consts.size();
+      d.compute.constants = spec_consts.empty() ? nullptr : spec_consts.data();
       pipe = wgpuDeviceCreateComputePipeline(ctx->device(), &d);
       if (pipe_layout) {
         wgpuPipelineLayoutRelease(pipe_layout);
@@ -169,17 +233,20 @@ class WebGPUBackend : public GPUBackend {
       }
       ctx->compute_pipeline_put(key, pipe);
     }
-    /* Compute work cannot be recorded inside a render pass. */
+    /* Build the bind group BEFORE opening the compute pass: assembly can record
+     * copies/uploads (snapshot_for_sampling, lazy uploads) that must land
+     * outside any pass. Compute also cannot be recorded inside a render pass. */
     ctx->render_pass_end();
+    WGPUBindGroupLayout bgl = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
+    WGPUBindGroup bg = ctx->build_bind_group(sh, sh->compute_bindings(), bgl);
     WGPUCommandEncoder enc = ctx->ensure_encoder();
     if (enc == nullptr) {
+      wgpuBindGroupLayoutRelease(bgl);
       return;
     }
     WGPUComputePassEncoder cpass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
-    WGPUBindGroupLayout bgl = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
-    WGPUBindGroup bg = ctx->build_bind_group(sh, sh->compute_bindings(), bgl);
     static int s_dispatch_log = 0;
-    if (s_dispatch_log < 8) {
+    if (s_dispatch_log < 16) {
       fprintf(stderr,
               "WGPU_DISPATCH #%d shader='%s' groups=%d,%d,%d bg=%p\n",
               s_dispatch_log++,
@@ -190,20 +257,90 @@ class WebGPUBackend : public GPUBackend {
               (void *)bg);
       fflush(stderr);
     }
-    wgpuComputePassEncoderSetPipeline(cpass, pipe);
+    /* A dispatch without its bind group is a validation error that POISONS the
+     * whole command buffer at submit (dropping all sibling passes) — skip it. */
     if (bg) {
+      wgpuComputePassEncoderSetPipeline(cpass, pipe);
       wgpuComputePassEncoderSetBindGroup(cpass, 0, bg, 0, nullptr);
+      wgpuComputePassEncoderDispatchWorkgroups(
+          cpass, uint32_t(groups_x_len), uint32_t(groups_y_len), uint32_t(groups_z_len));
     }
-    wgpuComputePassEncoderDispatchWorkgroups(
-        cpass, uint32_t(groups_x_len), uint32_t(groups_y_len), uint32_t(groups_z_len));
     wgpuComputePassEncoderEnd(cpass);
     wgpuComputePassEncoderRelease(cpass);
     if (bg) {
       wgpuBindGroupRelease(bg);
     }
     wgpuBindGroupLayoutRelease(bgl);
+    /* Isolate this dispatch in its own command buffer (see flush_encoder). */
+    ctx->flush_encoder();
   }
-  void compute_dispatch_indirect(StorageBuf * /*indirect_buf*/) override {}
+  void compute_dispatch_indirect(StorageBuf *indirect_buf) override
+  {
+    /* Same as compute_dispatch, but the workgroup counts come from a GPU buffer
+     * (e.g. eevee_shadow_page_clear sized by the rendermap pass). */
+    WebGPUContext *ctx = WebGPUContext::get();
+    if (ctx == nullptr || ctx->device() == nullptr || indirect_buf == nullptr) {
+      return;
+    }
+    WebGPUShader *sh = static_cast<WebGPUShader *>(ctx->shader);
+    if (sh == nullptr || !sh->is_valid() || sh->compute_module() == nullptr ||
+        sh->interface == nullptr)
+    {
+      return;
+    }
+    const uint64_t key = uint64_t(uintptr_t(sh)) ^ sh->spec_hash();
+    WGPUComputePipeline pipe = ctx->compute_pipeline_get(key);
+    if (pipe == nullptr) {
+      WGPUBindGroupLayout bgl_explicit = ctx->make_bind_group_layout(
+          sh->compute_bindings(), true, sh->interface);
+      WGPUPipelineLayout pipe_layout = ctx->make_pipeline_layout(bgl_explicit);
+      WGPUComputePipelineDescriptor d = {};
+      d.label = {sh->name_get().c_str(), WGPU_STRLEN};
+      d.layout = pipe_layout;
+      d.compute.module = sh->compute_module();
+      d.compute.entryPoint = {"main", WGPU_STRLEN};
+      std::vector<WGPUConstantEntry> spec_consts;
+      sh->spec_entries(sh->compute_wgsl(), spec_consts);
+      d.compute.constantCount = spec_consts.size();
+      d.compute.constants = spec_consts.empty() ? nullptr : spec_consts.data();
+      pipe = wgpuDeviceCreateComputePipeline(ctx->device(), &d);
+      if (pipe_layout) {
+        wgpuPipelineLayoutRelease(pipe_layout);
+      }
+      if (bgl_explicit) {
+        wgpuBindGroupLayoutRelease(bgl_explicit);
+      }
+      if (pipe == nullptr) {
+        return;
+      }
+      ctx->compute_pipeline_put(key, pipe);
+    }
+    WGPUBuffer ind = static_cast<WebGPUStorageBuf *>(indirect_buf)->buffer();
+    if (ind == nullptr) {
+      return;
+    }
+    ctx->render_pass_end();
+    WGPUBindGroupLayout bgl = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
+    WGPUBindGroup bg = ctx->build_bind_group(sh, sh->compute_bindings(), bgl);
+    WGPUCommandEncoder enc = ctx->ensure_encoder();
+    if (enc == nullptr) {
+      wgpuBindGroupLayoutRelease(bgl);
+      return;
+    }
+    WGPUComputePassEncoder cpass = wgpuCommandEncoderBeginComputePass(enc, nullptr);
+    if (bg) {
+      wgpuComputePassEncoderSetPipeline(cpass, pipe);
+      wgpuComputePassEncoderSetBindGroup(cpass, 0, bg, 0, nullptr);
+      wgpuComputePassEncoderDispatchWorkgroupsIndirect(cpass, ind, 0);
+    }
+    wgpuComputePassEncoderEnd(cpass);
+    wgpuComputePassEncoderRelease(cpass);
+    if (bg) {
+      wgpuBindGroupRelease(bg);
+    }
+    wgpuBindGroupLayoutRelease(bgl);
+    ctx->flush_encoder();
+  }
 
   Context *context_alloc(GHOST_IWindow *ghost_window, GHOST_IContext *ghost_context) override
   {
@@ -230,7 +367,13 @@ class WebGPUBackend : public GPUBackend {
   /* TODO: still stubs — implement as the render path starts exercising them. */
   Fence *fence_alloc() override { return nullptr; }
   PixelBuffer *pixelbuf_alloc(size_t /*size*/) override { return nullptr; }
-  QueryPool *querypool_alloc() override { return nullptr; }
+  /* Occlusion queries: WebGPU supports them, but reading results back is async
+   * (ResolveQuerySet → buffer map) while get_occlusion_result() is synchronous —
+   * same no-JSPI wall as all readbacks. Return a counting stub with zero
+   * samples: gizmo hover/click (gpu_select_sample_query) finds nothing instead
+   * of DEREFERENCING NULL and killing the main loop ("memory access out of
+   * bounds" on the first gizmo-area drag). */
+  QueryPool *querypool_alloc() override { return new WebGPUQueryPool; }
 
   void shader_cache_dir_clear_old() override {}
   void render_begin() override {}

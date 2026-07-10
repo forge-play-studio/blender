@@ -17,7 +17,15 @@
 #  define USHRT_MAX 0x0000FFFFu
 #  define UINT_MAX 0xFFFFFFFFu
 #endif
-#define NAN_FLT uintBitsToFloat(0x7FC00000u)
+#ifdef GPU_WEBGPU
+/* WGSL has no NaN literal and Tint's writer rejects constant-folded NaN.
+ * Route the bit pattern through a mutable module-scope variable so glslang
+ * cannot fold it — the NaN is then produced at runtime, which WGSL allows. */
+uint g_webgpu_nan_bits = 0x7FC00000u;
+#  define NAN_FLT uintBitsToFloat(g_webgpu_nan_bits)
+#else
+#  define NAN_FLT uintBitsToFloat(0x7FC00000u)
+#endif
 #define FLT_11_MAX uintBitsToFloat(0x477E0000)
 #define FLT_10_MAX uintBitsToFloat(0x477C0000)
 #define FLT_11_11_10_MAX float3(FLT_11_MAX, FLT_11_MAX, FLT_10_MAX)

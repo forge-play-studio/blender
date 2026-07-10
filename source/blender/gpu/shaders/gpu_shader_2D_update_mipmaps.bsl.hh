@@ -283,96 +283,80 @@ struct Resources {
 
     InnerType v0, v1, v2, h0, h1, h2, out_pixel;
 
-    /* Reduce vertically up to 3 times (depending on kernel horizontal size) */
-    switch (kernel_size.x) {
-      case 3:
-        switch (kernel_size.y) {
-          case 3:
-            v2 = load_sample(src_coord + int2(2, 2), load_from_shared);
-            ATTR_FALLTHROUGH;
-          case 2:
-            v1 = load_sample(src_coord + int2(2, 1), load_from_shared);
-            ATTR_FALLTHROUGH;
-          case 1:
-            v0 = load_sample(src_coord + int2(2, 0), load_from_shared);
-            break;
-        }
-        switch (kernel_size.y) {
-          case 3:
-            h2 = pyramid_reduce_3(w0, v0, w1, v1, w2, v2);
-            break;
-          case 2:
-            h2 = pyramid_reduce_2(v0, v1);
-            break;
-          case 1:
-            h2 = v0;
-            break;
-        }
-        ATTR_FALLTHROUGH;
-      case 2:
-        switch (kernel_size.y) {
-          case 3:
-            v2 = load_sample(src_coord + int2(1, 2), load_from_shared);
-            ATTR_FALLTHROUGH;
-          case 2:
-            v1 = load_sample(src_coord + int2(1, 1), load_from_shared);
-            ATTR_FALLTHROUGH;
-          case 1:
-            v0 = load_sample(src_coord + int2(1, 0), load_from_shared);
-            break;
-        }
-        switch (kernel_size.y) {
-          case 3:
-            h1 = pyramid_reduce_3(w0, v0, w1, v1, w2, v2);
-            break;
-          case 2:
-            h1 = pyramid_reduce_2(v0, v1);
-            break;
-          case 1:
-            h1 = v0;
-            break;
-        }
-        ATTR_FALLTHROUGH;
-      case 1:
-        switch (kernel_size.y) {
-          case 3:
-            v2 = load_sample(src_coord + int2(0, 2), load_from_shared);
-            ATTR_FALLTHROUGH;
-          case 2:
-            v1 = load_sample(src_coord + int2(0, 1), load_from_shared);
-            ATTR_FALLTHROUGH;
-          case 1:
-            v0 = load_sample(src_coord + int2(0, 0), load_from_shared);
-            break;
-        }
-        switch (kernel_size.y) {
-          case 3:
-            h0 = pyramid_reduce_3(w0, v0, w1, v1, w2, v2);
-            break;
-          case 2:
-            h0 = pyramid_reduce_2(v0, v1);
-            break;
-          case 1:
-            h0 = v0;
-            break;
-        }
+    /* Reduce vertically up to 3 times (depending on kernel horizontal size).
+     * NOTE: written as sequential range checks rather than switch fallthrough
+     * ("case 3 does everything case 2 does, plus one more sample") — the
+     * semantics are identical and it avoids switch fallthrough, which some
+     * SPIR-V consumers (Tint / WebGPU) do not support. */
+    if (kernel_size.x >= 3) {
+      if (kernel_size.y >= 3) {
+        v2 = load_sample(src_coord + int2(2, 2), load_from_shared);
+      }
+      if (kernel_size.y >= 2) {
+        v1 = load_sample(src_coord + int2(2, 1), load_from_shared);
+      }
+      v0 = load_sample(src_coord + int2(2, 0), load_from_shared);
+      if (kernel_size.y >= 3) {
+        h2 = pyramid_reduce_3(w0, v0, w1, v1, w2, v2);
+      }
+      else if (kernel_size.y == 2) {
+        h2 = pyramid_reduce_2(v0, v1);
+      }
+      else {
+        h2 = v0;
+      }
+    }
+    if (kernel_size.x >= 2) {
+      if (kernel_size.y >= 3) {
+        v2 = load_sample(src_coord + int2(1, 2), load_from_shared);
+      }
+      if (kernel_size.y >= 2) {
+        v1 = load_sample(src_coord + int2(1, 1), load_from_shared);
+      }
+      v0 = load_sample(src_coord + int2(1, 0), load_from_shared);
+      if (kernel_size.y >= 3) {
+        h1 = pyramid_reduce_3(w0, v0, w1, v1, w2, v2);
+      }
+      else if (kernel_size.y == 2) {
+        h1 = pyramid_reduce_2(v0, v1);
+      }
+      else {
+        h1 = v0;
+      }
+    }
+    {
+      if (kernel_size.y >= 3) {
+        v2 = load_sample(src_coord + int2(0, 2), load_from_shared);
+      }
+      if (kernel_size.y >= 2) {
+        v1 = load_sample(src_coord + int2(0, 1), load_from_shared);
+      }
+      v0 = load_sample(src_coord + int2(0, 0), load_from_shared);
+      if (kernel_size.y >= 3) {
+        h0 = pyramid_reduce_3(w0, v0, w1, v1, w2, v2);
+      }
+      else if (kernel_size.y == 2) {
+        h0 = pyramid_reduce_2(v0, v1);
+      }
+      else {
+        h0 = v0;
+      }
     }
 
     /* Reduce up to 3 samples horizontally. */
-    switch (kernel_size.x) {
-      case 3:
-        num_dst_pixels = dst_image_size.x;
-        rcp = 1.0f / (2 * num_dst_pixels + 1);
-        w0 = rcp * (num_dst_pixels - dst_coord.x);
-        w1 = rcp * num_dst_pixels;
-        w2 = 1.0f - w0 - w1;
-        out_pixel = pyramid_reduce_3(w0, h0, w1, h1, w2, h2);
-        break;
-      case 2:
-        out_pixel = pyramid_reduce_2(h0, h1);
-        break;
-      case 1:
-        out_pixel = h0;
+    if (kernel_size.x >= 3) {
+      num_dst_pixels = dst_image_size.x;
+      rcp = 1.0f / (2 * num_dst_pixels + 1);
+      w0 = rcp * (num_dst_pixels - dst_coord.x);
+      w1 = rcp * num_dst_pixels;
+      w2 = 1.0f - w0 - w1;
+      out_pixel = pyramid_reduce_3(w0, h0, w1, h1, w2, h2);
+    }
+    else if (kernel_size.x == 2) {
+      out_pixel = pyramid_reduce_2(h0, h1);
+    }
+    else {
+      out_pixel = h0;
     }
 
     /* Write out sample. */

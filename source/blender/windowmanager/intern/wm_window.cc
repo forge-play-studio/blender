@@ -1648,7 +1648,15 @@ void wm_window_make_drawable(wmWindowManager *wm, wmWindow *win)
 {
   BLI_assert(GPU_framebuffer_active_get() == GPU_framebuffer_back_get());
 
-  if (win != wm->runtime->windrawable && win->runtime->ghostwin) {
+  /* `windrawable == win` normally means the context is already active — but a
+   * FAILED secondary-window open (single-window web platform) can null the
+   * active GPU context on its cleanup path while `windrawable` still points at
+   * this window; the early-out then leaves every subsequent GPU call with a
+   * NULL context (crashed in the first wmOrtho2 of the next frame). Re-activate
+   * whenever the active context does not match the drawable window. */
+  const bool ctx_stale = (win == wm->runtime->windrawable) && win->runtime->gpuctx &&
+                         (GPU_context_active_get() != win->runtime->gpuctx);
+  if ((win != wm->runtime->windrawable || ctx_stale) && win->runtime->ghostwin) {
     // win->lmbut = 0; /* Keeps hanging when mouse-pressed while other window opened. */
     wm_window_clear_drawable(wm);
 
@@ -2408,6 +2416,12 @@ GHOST_TDrawingContextType wm_ghost_drawing_context_type(const GPUBackendType gpu
 
 void wm_test_gpu_backend_fallback(bContext *C)
 {
+#ifdef __EMSCRIPTEN__
+  /* The web build only ships the WebGPU backend; "falling back" from the
+   * userpref's (uncompiled) backend is the normal path, and the hardcoded
+   * "Vulkan -> OpenGL" wording is meaningless in a browser. */
+  return;
+#endif
   if (!bool(G.f & G_FLAG_GPU_BACKEND_FALLBACK)) {
     return;
   }

@@ -12,14 +12,19 @@ COMPUTE_SHADER_CREATE_INFO(draw_command_generate)
 
 #define atomicAddAndGet(dst, val) (atomicAdd(dst, val) + val)
 
+/* WORKAROUND (WebGPU/Tint): the *_counter members are accessed atomically, so
+ * every access must be an atomic op and the containing struct must never be
+ * loaded wholesale (Tint's SPIR-V atomics lowering asserts on mixed access).
+ * Plain reads use atomicAdd(x, 0), resets use atomicExchange. */
+
 /* This is only called by the last thread executed over the group's prototype draws. */
 void write_draw_call(DrawGroup group, uint group_id)
 {
   const bool indexed_draw = group.base_index != -1;
 
-  const uint back_facing_len = group_buf[group_id].back_facing_counter;
+  const uint back_facing_len = atomicAdd(group_buf[group_id].back_facing_counter, 0u);
   const uint back_facing_start = group.start * uint(view_len);
-  const uint front_facing_len = group_buf[group_id].front_facing_counter;
+  const uint front_facing_len = atomicAdd(group_buf[group_id].front_facing_counter, 0u);
   const uint front_facing_start = (group.start + (group.len - group.front_facing_len)) *
                                   uint(view_len);
 
@@ -66,9 +71,9 @@ void write_draw_call(DrawGroup group, uint group_id)
 
   /* Reset the counters for a next command gen dispatch. Avoids re-sending the whole data just
    * for this purpose. Only the last thread will execute this so it is thread-safe. */
-  group_buf[group_id].front_facing_counter = 0u;
-  group_buf[group_id].back_facing_counter = 0u;
-  group_buf[group_id].total_counter = 0u;
+  atomicExchange(group_buf[group_id].front_facing_counter, 0u);
+  atomicExchange(group_buf[group_id].back_facing_counter, 0u);
+  atomicExchange(group_buf[group_id].total_counter, 0u);
 }
 
 void main()
@@ -100,7 +105,16 @@ void main()
   }
   bool is_visible = visible_instance_len > 0;
 
-  DrawGroup group = group_buf[group_id];
+  /* WORKAROUND (WebGPU/Tint): member-wise copy of the non-atomic fields only —
+   * a whole-struct load would also load the atomic counters non-atomically. */
+  DrawGroup group;
+  group.next = group_buf[group_id].next;
+  group.start = group_buf[group_id].start;
+  group.len = group_buf[group_id].len;
+  group.front_facing_len = group_buf[group_id].front_facing_len;
+  group.vertex_len = group_buf[group_id].vertex_len;
+  group.vertex_first = group_buf[group_id].vertex_first;
+  group.base_index = group_buf[group_id].base_index;
 
   if (!is_visible) {
     /* Skip the draw but still count towards the completion. */

@@ -27,6 +27,21 @@ FRAGMENT_SHADER_CREATE_INFO(overlay_outline_detect)
 #define APEX_YPOS (ALL & (~YPOS))
 #define APEX_YNEG (ALL & (~YNEG))
 
+#ifdef GPU_WEBGPU
+/* WGSL cannot SAMPLE integer textures (textureSampleLevel on texture_2d<u32>
+ * has no overload) — fetch the nearest texel instead, which is exactly what
+ * nearest-sampling an id buffer does. */
+uint outline_id_sample(float2 uv)
+{
+  int2 sz = textureSize(outline_id_tx, 0).xy;
+  int2 texel = clamp(int2(uv * float2(sz)), int2(0), sz - 1);
+  return texelFetch(outline_id_tx, texel, 0).r;
+}
+#  define OUTLINE_ID_SAMPLE(uv) outline_id_sample(uv)
+#else
+#  define OUTLINE_ID_SAMPLE(uv) textureLod(outline_id_tx, uv, 0.0f).r
+#endif
+
 bool has_edge(uint id, float2 uv, uint ref, uint &ref_col, float2 &depth_uv)
 {
   if (ref_col == 0u) {
@@ -45,10 +60,10 @@ bool4 gather_edges(float2 uv, uint ref)
   ids = textureGather(outline_id_tx, uv);
 #else
   float3 ofs = float3(0.5f, 0.5f, -0.5f) * uniform_buf.size_viewport_inv.xyy;
-  ids.x = textureLod(outline_id_tx, uv - ofs.xz, 0.0f).r;
-  ids.y = textureLod(outline_id_tx, uv + ofs.xy, 0.0f).r;
-  ids.z = textureLod(outline_id_tx, uv + ofs.xz, 0.0f).r;
-  ids.w = textureLod(outline_id_tx, uv - ofs.xy, 0.0f).r;
+  ids.x = OUTLINE_ID_SAMPLE(uv - ofs.xz);
+  ids.y = OUTLINE_ID_SAMPLE(uv + ofs.xy);
+  ids.z = OUTLINE_ID_SAMPLE(uv + ofs.xz);
+  ids.w = OUTLINE_ID_SAMPLE(uv - ofs.xy);
 #endif
 
   return notEqual(ids, uint4(ref));
@@ -165,7 +180,7 @@ void diag_dir(bool4 edges1, bool4 edges2, float2 &line_start, float2 &line_end)
 void main()
 {
   float2 screen_uv = gl_FragCoord.xy / float2(textureSize(outline_id_tx, 0).xy);
-  uint ref = textureLod(outline_id_tx, screen_uv, 0.0f).r;
+  uint ref = OUTLINE_ID_SAMPLE(screen_uv);
   uint ref_col = ref;
 
   float2 uvs = gl_FragCoord.xy * uniform_buf.size_viewport_inv;
@@ -192,10 +207,10 @@ void main()
     ids.yw = textureGather(outline_id_tx, uvs - ofs.xy * 0.5f).xz;
   }
 #else
-  ids.x = textureLod(outline_id_tx, uvs + ofs.xz, 0.0f).r;
-  ids.y = textureLod(outline_id_tx, uvs - ofs.xz, 0.0f).r;
-  ids.z = textureLod(outline_id_tx, uvs + ofs.zy, 0.0f).r;
-  ids.w = textureLod(outline_id_tx, uvs - ofs.zy, 0.0f).r;
+  ids.x = OUTLINE_ID_SAMPLE(uvs + ofs.xz);
+  ids.y = OUTLINE_ID_SAMPLE(uvs - ofs.xz);
+  ids.z = OUTLINE_ID_SAMPLE(uvs + ofs.zy);
+  ids.w = OUTLINE_ID_SAMPLE(uvs - ofs.zy);
 #endif
 
   bool has_edge_pos_x = has_edge(ids.x, uvs + ofs.xz, ref, ref_col, depth_uv);
@@ -211,10 +226,10 @@ void main()
       ids.z = tmp3.y;
       ids.w = tmp4.y;
 #else
-      ids.x = textureLod(outline_id_tx, uvs + 2.0f * ofs.xz, 0.0f).r;
-      ids.y = textureLod(outline_id_tx, uvs - 2.0f * ofs.xz, 0.0f).r;
-      ids.z = textureLod(outline_id_tx, uvs + 2.0f * ofs.zy, 0.0f).r;
-      ids.w = textureLod(outline_id_tx, uvs - 2.0f * ofs.zy, 0.0f).r;
+      ids.x = OUTLINE_ID_SAMPLE(uvs + 2.0f * ofs.xz);
+      ids.y = OUTLINE_ID_SAMPLE(uvs - 2.0f * ofs.xz);
+      ids.z = OUTLINE_ID_SAMPLE(uvs + 2.0f * ofs.zy);
+      ids.w = OUTLINE_ID_SAMPLE(uvs - 2.0f * ofs.zy);
 #endif
 
       has_edge_pos_x = has_edge(ids.x, uvs + 2.0f * ofs.xz, ref, ref_col, depth_uv);

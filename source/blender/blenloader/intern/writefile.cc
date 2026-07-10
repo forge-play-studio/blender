@@ -314,9 +314,11 @@ bool ZstdWriteWrap::open(const char *filepath)
     return false;
   }
 
+#ifndef __EMSCRIPTEN__
   /* Leave one thread open for the main writing logic, unless we only have one HW thread. */
   int num_threads = max_ii(1, BLI_system_thread_count() - 1);
   BLI_threadpool_init(&threadpool, ZstdWriteBlockTask::write_task, num_threads);
+#endif
   BLI_mutex_init(&mutex);
   BLI_condition_init(&condition);
 
@@ -366,7 +368,9 @@ void ZstdWriteWrap::write_seekable_frames()
 
 bool ZstdWriteWrap::close()
 {
+#ifndef __EMSCRIPTEN__
   BLI_threadpool_end(&threadpool);
+#endif
   tasks.free_no_destruct();
 
   BLI_mutex_end(&mutex);
@@ -390,6 +394,15 @@ bool ZstdWriteWrap::write(const void *buf, const size_t buf_len)
   task->size = buf_len;
   task->frame_number = num_frames++;
   task->ww = this;
+
+#ifdef __EMSCRIPTEN__
+  /* Worker threads cannot progress while the main thread blocks joining them
+   * (browser main thread) — compress inline. Frame ordering is trivially
+   * satisfied, so write_task's condition wait never blocks. */
+  write_task(task);
+  MEM_delete(task);
+  return !write_error;
+#endif
 
   BLI_mutex_lock(&mutex);
   BLI_addtail(&tasks, task);
@@ -2107,6 +2120,13 @@ static bool BLO_write_file_impl(Main *mainvar,
   }
 
   if (BLI_rename_overwrite(tempname, filepath) != 0) {
+    fprintf(stderr,
+            "BLO rename_overwrite FAILED '%s' -> '%s' errno=%d (%s)\n",
+            tempname,
+            filepath,
+            errno,
+            strerror(errno));
+    fflush(stderr);
     BKE_report(reports, RPT_ERROR, "Cannot change old file (file saved with @)");
     return false;
   }

@@ -30,6 +30,12 @@ namespace blender {
 
 using namespace blender::gpu;
 
+#ifdef __EMSCRIPTEN__
+namespace gpu {
+void wgpu_select_query_hint(int x, int y); /* webgpu_context.cc */
+}
+#endif
+
 struct GPUSelectQueryState {
   /** Tracks whether a query has been issued so that gpu_load_id can end the previous one. */
   bool query_issued;
@@ -59,6 +65,17 @@ void gpu_select_query_begin(GPUSelectBuffer *buffer,
                             int oldhits)
 {
   GPU_debug_group_begin("Selection Queries");
+
+#ifdef __EMSCRIPTEN__
+  {
+    /* Tell the WebGPU backend which cursor position this query round is FOR:
+     * occlusion results arrive asynchronously and are cached per position, so a
+     * later query at the same position (the CLICK_DRAG re-check of the press
+     * location in the gizmo handler) is served that round's completed answer. */
+    gpu::wgpu_select_query_hint((input->xmin + input->xmax) / 2,
+                                (input->ymin + input->ymax) / 2);
+  }
+#endif
 
   g_query_state.query_issued = false;
   g_query_state.buffer = buffer;

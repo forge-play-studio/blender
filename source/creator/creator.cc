@@ -7,6 +7,11 @@
  */
 
 #include <cstdlib>
+#ifdef __EMSCRIPTEN__
+#  include <emscripten/wasmfs.h>
+#  include <pthread.h>
+#  include <sys/stat.h>
+#endif
 #include <cstring>
 
 #ifdef WIN32
@@ -361,6 +366,64 @@ int main(int argc,
 #endif
 
   restore_ld_preload();
+
+#ifdef __EMSCRIPTEN__
+  /* Release/demo builds (BLENDER_WEB_OPFS env, set by the demo page): mount
+   * the browser's Origin Private File System at /opfs via the wasmfs OPFS
+   * backend. The demo keeps ASSETS (extracted once by its setup screen) at
+   * /opfs/assets and points HOME at /opfs/home for real persistence. The dev
+   * fast-path (web/blender-gui.html) never sets the env and keeps using the
+   * --preload-file MEMFS tree. */
+  if (getenv("BLENDER_WEB_OPFS")) {
+    /* wasmfs asserts if the OPFS backend is created on the main browser
+     * thread (needs an async JS handshake) — do it on a pthread. The pool is
+     * preloaded (PTHREAD_POOL_SIZE), so the thread starts while main blocks
+     * in join. Subsequent main-thread file access proxies to the dedicated
+     * OPFS worker. */
+    auto mount_fn = [](void *) -> void * {
+      backend_t opfs = wasmfs_create_opfs_backend();
+      if (opfs == nullptr || wasmfs_create_directory("/opfs", 0777, opfs) != 0) {
+        fprintf(stderr, "BLENDER_WEB_OPFS: mounting /opfs FAILED\n");
+      }
+      else {
+        mkdir("/opfs/home", 0777); /* EEXIST is fine. */
+      }
+      return nullptr;
+    };
+    pthread_t mount_thread;
+    if (pthread_create(&mount_thread, nullptr, +mount_fn, nullptr) == 0) {
+      pthread_join(mount_thread, nullptr);
+    }
+    else {
+      fprintf(stderr, "BLENDER_WEB_OPFS: mount thread creation FAILED\n");
+    }
+  }
+  /* wasmfs creates every --preload-file PARENT directory with a hardcoded
+   * 0555 mode (S_IRUGO|S_IXUGO in wasmfs.cpp's preload flush, ignoring the
+   * packager's canWrite flag). The python sysroot preload path runs through
+   * /home/..., which leaves $HOME read-only: blend save (rename of the "@"
+   * temp file) and config writes fail with EACCES. Re-open the HOME chain. */
+  {
+    chmod("/home", 0777);
+    const char *home_dir = getenv("HOME");
+    if (home_dir && home_dir[0] == '/') {
+      char path_buf[1024];
+      const size_t home_len = strlen(home_dir);
+      if (home_len < sizeof(path_buf)) {
+        memcpy(path_buf, home_dir, home_len + 1);
+        for (char *p = path_buf + 1; *p; p++) {
+          if (*p == '/') {
+            *p = '\0';
+            chmod(path_buf, 0777);
+            *p = '/';
+          }
+        }
+        mkdir(path_buf, 0777); /* Ensure HOME itself exists. */
+        chmod(path_buf, 0777);
+      }
+    }
+  }
+#endif
 
 #ifdef WIN32
 #  ifdef USE_WIN32_UNICODE_ARGS

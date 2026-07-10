@@ -32,6 +32,27 @@ class WebGPUFrameBuffer : public FrameBuffer {
   bool depth_clear_pending_ = false;
   float clear_depth_ = 1.0f;
 
+  /* Attachment-less rendering (EEVEE shadow atlas / tag passes write only via
+   * imageStore): WebGPU requires >= 1 attachment, so a dummy R8Unorm color
+   * target of the framebuffer's default size is attached at slot 0. */
+  WGPUTexture dummy_att_tex_ = nullptr;
+  WGPUTextureView dummy_att_view_ = nullptr;
+  int dummy_w_ = 0, dummy_h_ = 0;
+
+ public:
+  /* True when the fb has no color and no depth attachments (uses default size). */
+  bool is_attachmentless() const
+  {
+    for (int i = 0; i < GPU_FB_MAX_ATTACHMENT; i++) {
+      if (attachments_[i].tex) {
+        return false;
+      }
+    }
+    return width_ > 0 && height_ > 0;
+  }
+
+ private:
+
  public:
   WebGPUFrameBuffer(const char *name) : FrameBuffer(name) {}
 
@@ -43,6 +64,9 @@ class WebGPUFrameBuffer : public FrameBuffer {
              uint clear_stencil) override;
   void clear_multi(Span<double4> clear_cols) override;
   void clear_attachment(GPUAttachmentType type, const double4 clear_value) override;
+  /* Immediately record an empty pass consuming the pending clears (GL glClear
+   * semantics — see impl comment). */
+  void execute_pending_clears();
   void attachment_set_loadstore_op(GPUAttachmentType type, GPULoadStore ls) override;
   void read(GPUFrameBufferBits planes,
             eGPUDataFormat format,
@@ -70,6 +94,14 @@ class WebGPUFrameBuffer : public FrameBuffer {
  protected:
   void subpass_transition_impl(const GPUAttachmentState depth_attachment_state,
                                Span<GPUAttachmentState> color_attachment_states) override;
+
+ private:
+  /* Slots currently used as (emulated) sub-pass inputs: excluded from the
+   * effective attachment set (render pass AND pipeline formats) while the
+   * canonical attachments_ array stays intact, GL-style. */
+  bool subpass_detached_[GPU_FB_MAX_COLOR_ATTACHMENT] = {};
+
+ public:
 };
 
 }  // namespace blender::gpu

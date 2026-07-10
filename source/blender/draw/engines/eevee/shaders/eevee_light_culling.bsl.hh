@@ -87,7 +87,11 @@ void cull_main([[resource_table]] Cull &srt,
           return;
         }
       }
-      ATTR_FALLTHROUGH;
+      /* WORKAROUND: fallthrough with a non-empty case body is not supported by
+       * Tint's SPIR-V reader (WebGPU backend); duplicate the shared tail. */
+      sphere.center = light.position();
+      sphere.radius = light.local().local.influence_radius_max;
+      break;
     }
     case LIGHT_RECT:
     case LIGHT_ELLIPSE:
@@ -430,8 +434,16 @@ void tile_main([[resource_table]] const draw::View &views,
           intersect_tile = intersect_tile && tile.intersect(pyramid);
           break;
         }
-        /* Fall-through to the hemispheric case. */
-        ATTR_FALLTHROUGH;
+        /* Hemispheric case. WORKAROUND: duplicated from LIGHT_RECT below —
+         * fallthrough with a non-empty case body is not supported by Tint's
+         * SPIR-V reader (WebGPU backend). */
+        float3 s000 = vP - v_right * radius - v_up * radius;
+        float3 s100 = s000 + v_right * (radius * 2.0f);
+        float3 s010 = s000 + v_up * (radius * 2.0f);
+        float3 s001 = s000 - v_back * radius;
+        Box sbbox = shape_box(s000, s100, s010, s001);
+        intersect_tile = intersect_tile && tile.intersect(sbbox);
+        break;
       }
       case LIGHT_RECT:
       case LIGHT_ELLIPSE: {

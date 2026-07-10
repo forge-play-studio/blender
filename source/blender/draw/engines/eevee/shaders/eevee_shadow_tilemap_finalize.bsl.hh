@@ -68,7 +68,14 @@ void tilemap_finalize_main([[resource_table]] TilemapFinalize &srt,
 
   srt.lod_rendered = 0u;
 
-  for (int lod = lod_max; lod >= 0; lod--) {
+  /* Constant trip count so the barriers below sit in provably-uniform control
+   * flow (WGSL uniformity analysis cannot prove `lod_max` uniform — it derives
+   * from a storage-buffer load). Iterations past lod_max are masked: the rect
+   * reset still runs (leaving an empty rect → no view issued) and the tile load
+   * is replaced by SHADOW_NO_DATA (also avoids an out-of-range tile offset for
+   * non-cubeface tilemaps). */
+  for (int lod = SHADOW_TILEMAP_LOD; lod >= 0; lod--) {
+    bool lod_active = (lod <= lod_max);
     int2 tile_co_lod = tile_co >> lod;
     int tile_index = shadow_tile_offset(uint2(tile_co_lod), tilemap_data.tiles_index, lod);
 
@@ -82,7 +89,8 @@ void tilemap_finalize_main([[resource_table]] TilemapFinalize &srt,
 
     barrier();
 
-    ShadowTileData tile = shadow_tile_unpack(srt.tiles_buf[tile_index]);
+    ShadowTileData tile = shadow_tile_unpack(lod_active ? srt.tiles_buf[tile_index] :
+                                                          SHADOW_NO_DATA);
     bool lod_valid_thread = all(equal(tile_co, tile_co_lod << lod));
     bool do_page_render = tile.is_used && tile.do_update && lod_valid_thread;
     if (do_page_render) {

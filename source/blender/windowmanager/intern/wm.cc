@@ -39,6 +39,18 @@
 #include "BKE_screen.hh"
 #include "BKE_workspace.hh"
 
+#ifdef __EMSCRIPTEN__
+#  include <vector>
+
+#  include "BKE_image.hh"
+#  include "BKE_image_gpu.hh"
+#  include "BKE_image_partial_update.hh"
+#  include "DNA_scene_types.h"
+#  include "IMB_imbuf.hh"
+#  include "IMB_imbuf_types.hh"
+#  include "RE_pipeline.h"
+#endif
+
 #include "PRF_profile.hh"
 
 #include "WM_api.hh"
@@ -62,6 +74,10 @@
 #endif
 
 #include "BLO_read_write.hh"
+
+#ifdef __EMSCRIPTEN__
+#  include <emscripten/emscripten.h>
+#endif
 
 namespace blender {
 
@@ -595,6 +611,128 @@ void wm_close_and_free(bContext *C, wmWindowManager *wm)
   MEM_delete(wm->runtime);
 }
 
+#ifdef __EMSCRIPTEN__
+/* webgpu_context.cc: completed asynchronous film readback (see
+ * film_capture_async). GUI F12: the render job reads the film synchronously
+ * and gets zeros; the real pixels arrive here a few ticks later and get
+ * injected into the "Combined" pass of the scene's RenderResult. */
+namespace gpu {
+bool wgpu_film_result_take(std::vector<float> &r_pixels, int &r_w, int &r_h);
+}
+
+static void wm_step_apply_film_result(bContext *C)
+{
+  std::vector<float> pixels;
+  int w = 0, h = 0;
+  if (!gpu::wgpu_film_result_take(pixels, w, h)) {
+    return;
+  }
+  /* DEBUG: make the injected data unmistakable. */
+  if (getenv("WGPU_FILM_DEBUG_RED")) {
+    for (size_t i = 0; i < pixels.size(); i += 4) {
+      pixels[i + 0] = 1.0f;
+      pixels[i + 1] = 0.0f;
+      pixels[i + 2] = 0.0f;
+      pixels[i + 3] = 1.0f;
+    }
+  }
+  fprintf(stderr,
+          "WGPU_FILM px(0,0)=(%.3f,%.3f,%.3f,%.3f) center=(%.3f,%.3f,%.3f,%.3f)\n",
+          pixels[0], pixels[1], pixels[2], pixels[3],
+          pixels[(size_t(h / 2) * w + w / 2) * 4 + 0],
+          pixels[(size_t(h / 2) * w + w / 2) * 4 + 1],
+          pixels[(size_t(h / 2) * w + w / 2) * 4 + 2],
+          pixels[(size_t(h / 2) * w + w / 2) * 4 + 3]);
+  fflush(stderr);
+  Scene *scene = CTX_data_scene(C);
+  Render *re = scene ? RE_GetSceneRender(scene) : nullptr;
+  if (re == nullptr) {
+    fprintf(stderr, "WGPU_FILM inject: no Render for scene\n");
+    fflush(stderr);
+    return;
+  }
+  RenderResult *rr = RE_AcquireResultWrite(re);
+  bool injected = false;
+  if (rr == nullptr) {
+    fprintf(stderr, "WGPU_FILM inject: no RenderResult\n");
+  }
+  else if (rr->rectx != w || rr->recty != h) {
+    fprintf(stderr, "WGPU_FILM inject: dims %dx%d vs rr %dx%d\n", w, h, rr->rectx, rr->recty);
+  }
+  else {
+    /* Fill EVERY float buffer the result exposes: the "Combined" pass, each
+     * RenderView's ibuf and the result-level ibuf (the editor displays via the
+     * view/result ibuf, which was built from the pass while it held zeros). */
+    auto fill_ibuf = [&](ImBuf *ibuf, const char *what) {
+      if (ibuf && ibuf->x == w && ibuf->y == h) {
+        /* The engine may have handed the (now recycled!) film GPU texture to
+         * this ibuf — the editor would display that stale GPU side instead of
+         * our CPU floats. Drop it. */
+        IMB_free_gpu_textures(ibuf);
+        if (ibuf->float_buffer.data) {
+          memcpy(ibuf->float_data_for_write(), pixels.data(), sizeof(float) * 4 * w * h);
+          fprintf(stderr, "WGPU_FILM filled %s ibuf %p\n", what, (void *)ibuf);
+          injected = true;
+        }
+      }
+    };
+    for (RenderLayer &rl : rr->layers) {
+      for (RenderPass &rp : rl.passes) {
+        if (STREQ(rp.name, "Combined") && rp.channels == 4) {
+          fill_ibuf(rp.ibuf, "pass");
+        }
+      }
+    }
+    for (RenderView &rv : rr->views) {
+      if (rv.ibuf == nullptr) {
+        /* Never created (the display-update callbacks that normally build it
+         * ran while the result was still empty). The image editor's
+         * `have_combined` requires it. */
+        rv.ibuf = IMB_allocFromBuffer(nullptr, pixels.data(), uint(w), uint(h), 4);
+        if (rv.ibuf) {
+          fprintf(stderr, "WGPU_FILM created view ibuf %p\n", (void *)rv.ibuf);
+          injected = true;
+        }
+      }
+      else {
+        fill_ibuf(rv.ibuf, "view");
+      }
+    }
+    fill_ibuf(rr->ibuf, "result");
+  }
+  if (rr) {
+    RE_ReleaseResult(re);
+  }
+  if (injected) {
+    /* Drop every cached/display buffer of the viewer image so the editor
+     * re-acquires from the (now filled) RenderResult. */
+    Image *ima = BKE_image_ensure_viewer(CTX_data_main(C), IMA_TYPE_R_RESULT, "Render Result");
+    BKE_image_free_gpu_texture_caches(ima);
+    BKE_image_signal(CTX_data_main(C), ima, nullptr, IMA_SIGNAL_FREE);
+    BKE_image_partial_update_mark_full_update(ima);
+    WM_event_add_notifier(C, NC_IMAGE | NA_EDITED, ima);
+    WM_event_add_notifier(C, NC_SCENE | ND_RENDER_RESULT, scene);
+    fprintf(stderr, "WGPU_FILM injected into RenderResult %dx%d\n", w, h);
+  }
+  fflush(stderr);
+}
+
+static void wm_main_step(void *arg)
+{
+  bContext *C = static_cast<bContext *>(arg);
+  wm_step_apply_film_result(C);
+  /* Get events from ghost, handle window events, add to window queues. */
+  wm_window_events_process(C);
+  /* Per window, all events to the window, screen, area and region handlers. */
+  wm_event_do_handlers(C);
+  /* Events have left notes about changes, we handle and cache it. */
+  wm_event_do_notifiers(C);
+  /* Execute cached changes draw. */
+  wm_draw_update(C);
+  PRF_frame_mark;
+}
+#endif
+
 void WM_main(bContext *C)
 {
   PRF_scope(ProfileCategory::Core);
@@ -602,6 +740,13 @@ void WM_main(bContext *C)
    * This ensures we don't run operators before the depsgraph has been evaluated. */
   wm_event_do_refresh_wm_and_depsgraph(C);
 
+#ifdef __EMSCRIPTEN__
+  /* The browser owns the outer loop: yield between iterations so html5 input
+   * callbacks are delivered and the WebGPU canvas frame presents (a blocked
+   * thread never presents). Runs on the proxied-main pthread; fps=0 →
+   * requestAnimationFrame pacing. Does not return. */
+  emscripten_set_main_loop_arg(wm_main_step, C, 0, true);
+#else
   while (true) {
 
     /* Get events from ghost, handle window events, add to window queues. */
@@ -618,6 +763,7 @@ void WM_main(bContext *C)
 
     PRF_frame_mark;
   }
+#endif
 }
 
 }  // namespace blender

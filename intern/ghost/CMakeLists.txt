@@ -135,6 +135,14 @@ list(APPEND SRC
 
 if(WITH_HEADLESS)
   add_definitions(-DWITH_HEADLESS)
+elseif(WITH_GHOST_WEB)
+  list(APPEND SRC
+    intern/GHOST_SystemWeb.cc
+
+    intern/GHOST_SystemWeb.hh
+    intern/GHOST_WindowWeb.hh
+  )
+  add_definitions(-DWITH_GHOST_WEB)
 elseif(WITH_GHOST_SDL)
   list(APPEND SRC
     intern/GHOST_ContextSDL.cc

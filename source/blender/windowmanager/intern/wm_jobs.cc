@@ -528,8 +528,22 @@ void WM_jobs_start(wmWindowManager *wm, wmJob *wm_job)
 
         // printf("job started: %s\n", wm_job->name);
 
+#ifdef __EMSCRIPTEN__
+        /* Run the job SYNCHRONOUSLY on the main thread: worker pthreads cannot
+         * touch WebGPU (emdawnwebgpu handles are bound to the creating
+         * thread), and GPU-using jobs (F12 render!) would crash on their first
+         * GPU call. Blocking the tab for the job's duration is the acceptable
+         * trade-off. The ready flag hands completion to the normal timer
+         * machinery (wm_jobs_timer → wm_job_end). */
+        fprintf(stderr, "WM_JOB sync start '%s'\n", wm_job->name);
+        fflush(stderr);
+        do_job_thread(wm_job);
+        fprintf(stderr, "WM_JOB sync done '%s'\n", wm_job->name);
+        fflush(stderr);
+#else
         BLI_threadpool_init(&wm_job->threads, do_job_thread, 1);
         BLI_threadpool_insert(&wm_job->threads, wm_job);
+#endif
       }
 
       /* Restarted job has timer already. */
@@ -751,9 +765,19 @@ void wm_jobs_handle_finished(const bContext *C)
 {
   wmWindowManager *wm = CTX_wm_manager(C);
   for (wmJob &job : wm->runtime->jobs.items_reversed_mutable()) {
+#ifdef __EMSCRIPTEN__
+    /* Synchronous jobs (see WM_jobs_start) never insert a thread — a finished
+     * one is `running && ready` with an empty pool. Without this the job never
+     * "ends": no end callbacks, no notifiers (the render-result display never
+     * refreshed), and the status bar showed "Rendering..." forever. */
+    if (!job.threads.first && !(job.running && job.ready)) {
+      continue;
+    }
+#else
     if (!job.threads.first) {
       continue;
     }
+#endif
 
     /* Let threads get temporary lock over main thread if needed. */
     wm_job_main_thread_yield(&job);
