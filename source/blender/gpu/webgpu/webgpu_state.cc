@@ -12,11 +12,12 @@
 
 namespace blender::gpu {
 
-void WebGPUStateManager::texture_bind(Texture *tex, GPUSamplerState /*sampler*/, int unit)
+void WebGPUStateManager::texture_bind(Texture *tex, GPUSamplerState sampler, int unit)
 {
   WebGPUContext *ctx = WebGPUContext::get();
   if (ctx) {
     ctx->bind_texture(unit, static_cast<WebGPUTexture *>(tex));
+    ctx->bind_texture_state(unit, sampler);
   }
 }
 

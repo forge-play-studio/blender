@@ -31,6 +31,12 @@ class WebGPUTexture : public Texture {
    * (WebGPU forbids multi-aspect views in texture bindings). */
   std::map<uint32_t, WGPUTextureView> attachment_views_;
   WGPUTextureView sample_view_ = nullptr;
+  /* Sampling mip window (GPU_texture_mip_range_set): Blender clamps sampling
+   * to the mips it has actually uploaded/generated. Ignoring it samples
+   * Dawn-zero-initialized mips (black blended in). */
+  int mip_min_ = 0;
+  int mip_max_ = -1; /* -1 = full chain. */
+  WGPUTextureView mip_range_view_ = nullptr;
   WGPUTextureView storage_view_ = nullptr;
   /* Set when this texture is a view onto another texture's WGPUTexture (which
    * it then only references, never destroys). Reads/attachments offset into the
@@ -38,6 +44,7 @@ class WebGPUTexture : public Texture {
   bool is_view_ = false;
   int view_layer_ = 0;
   int view_mip_ = 0;
+  long long alloc_bytes_ = 0;
 
  public:
   WebGPUTexture(const char *name);
@@ -60,13 +67,40 @@ class WebGPUTexture : public Texture {
   void copy_to(Texture *dst, IndexRange mip_levels) override;
   void clear(const double4 data) override;
   void swizzle_set(const char /*swizzle_mask*/[4]) override {}
-  void mip_range_set(int /*min*/, int /*max*/) override {}
+  void mip_range_set(int min, int max) override;
   void read(int mip, eGPUDataFormat format, void *dst) override;
 
+  /* Debug probes (WGPU_SUM_TEX) match live textures by name. */
+  const std::string &debug_name() const
+  {
+    return name_;
+  }
+  void debug_rename(const char *name)
+  {
+    name_ = name;
+  }
   WGPUTexture wgpu_texture() const
   {
     return texture_;
   }
+  int view_mip() const
+  {
+    return view_mip_;
+  }
+  int view_layer() const
+  {
+    return view_layer_;
+  }
+  bool is_view() const
+  {
+    return is_view_;
+  }
+  /* True when this texture's CREATED WGPUTextureUsage covers what `req` needs.
+   * usage_set() after init cannot widen the wgpu-side usage, so pool reuse
+   * must check against creation flags: handing a non-RenderAttachment texture
+   * to a framebuffer invalidates the whole command buffer at submit (every
+   * later pass in it is silently dropped). */
+  bool wgpu_usage_covers(eGPUTextureUsage req) const;
   WGPUTextureView wgpu_view() const
   {
     return view_;

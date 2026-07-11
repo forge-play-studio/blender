@@ -24,6 +24,12 @@ class WebGPUStateManager : public StateManager {
   void apply_state() override {}
   void force_state() override {}
 
+  /* NOTE: implementing this as an unconditional render-pass split regressed
+   * glass/deferred scenes to black with ZERO validation errors — pass splits
+   * change more semantics than expected (2026-07-11). The volume pipeline's
+   * writable/read-only same-pass buffer conflict needs a NARROWER fix (split
+   * only when the next draw's bind set actually conflicts with the open
+   * pass's usage). */
   void issue_barrier(GPUBarrier /*barrier_bits*/) override {}
 
   /* Route texture/image binds into the context binding tables (consumed when a

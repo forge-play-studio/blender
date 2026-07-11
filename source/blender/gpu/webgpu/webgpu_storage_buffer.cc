@@ -171,10 +171,42 @@ void WebGPUStorageBuf::copy_sub(VertBuf * /*src*/,
 
 void WebGPUStorageBuf::read(void *data)
 {
-  /* CPU shadow holds the last host-written contents. True GPU readback needs an
-   * async buffer map (wgpuBufferMapAsync) routed through the queue; deferred
-   * until compute results need to round-trip to the host. */
-  if (data && data_) {
+  if (data == nullptr) {
+    return;
+  }
+  WebGPUContext *ctx = webgpu_context_get();
+  if (ctx != nullptr && ctx->device() != nullptr && buffer_ != nullptr) {
+    /* Real GPU readback: flush recorded work, copy into a MapRead staging
+     * buffer, block on the map (JSPI / WaitAny — same path as select-id
+     * picks). Falls back to the host mirror on map failure. */
+    ctx->flush_if_pass_open("ssbo_read");
+    const size_t asz = (size_in_bytes_ + 3) & ~size_t(3);
+    WGPUBufferDescriptor bd = {};
+    bd.label = {"ssbo_read_staging", WGPU_STRLEN};
+    bd.size = asz;
+    bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+    WGPUBuffer st = wgpuDeviceCreateBuffer(ctx->device(), &bd);
+    if (st != nullptr) {
+      WGPUCommandEncoder enc = ctx->ensure_encoder();
+      if (enc != nullptr) {
+        wgpuCommandEncoderCopyBufferToBuffer(enc, buffer_, 0, st, 0, asz);
+        ctx->flush_encoder();
+        std::vector<uint8_t> tmp(asz);
+        if (ctx->map_read_sync(st, asz, tmp.data())) {
+          memcpy(data, tmp.data(), size_in_bytes_);
+          if (data_) {
+            /* Keep the host mirror coherent. */
+            memcpy(data_, tmp.data(), size_in_bytes_);
+          }
+          wgpuBufferRelease(st);
+          return;
+        }
+      }
+      wgpuBufferRelease(st);
+    }
+  }
+  /* Fallback: last host-written contents. */
+  if (data_) {
     memcpy(data, data_, size_in_bytes_);
   }
 }

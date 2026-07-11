@@ -44,11 +44,30 @@ Texture *WebGPUTexturePool::acquire_texture_impl(int3 extent,
     Texture *t = pool_[i].texture;
     if (t->format_get() == format && t->width_get() == extent.x &&
         t->height_get() == extent.y && t->depth_get() == extent.z &&
-        t->mip_count() == mip_len)
+        t->mip_count() == mip_len &&
+        /* The wgpu-side usage is fixed at creation; usage_set() below only
+         * updates bookkeeping. Reusing a texture whose created usage lacks a
+         * requested bit (e.g. RenderAttachment for DoF's scatter target)
+         * fails render-pass validation and kills the entire command buffer,
+         * dropping every later pass in the frame. */
+        static_cast<WebGPUTexture *>(t)->wgpu_usage_covers(usage))
     {
       pool_.remove_and_reorder(i);
       t->usage_set(usage | GPU_TEXTURE_USAGE_FORMAT_VIEW);
-      acquired_.add(t, 1);
+      acquired_.add(t, 0);
+      if (name) {
+        /* Re-label on every acquisition: pool textures otherwise keep their
+         * FIRST user's name forever, which breaks name-matched debug probes
+         * and mislabels captures. */
+        static_cast<WebGPUTexture *>(t)->debug_rename(name);
+      }
+      /* DEBUG: ENV.WGPU_POOL_CLEAR=1 — zero reused textures so reuse behaves
+       * like a fresh (spec-zeroed) allocation. Bisects read-before-write bugs
+       * on pooled textures: pool assignment order varies run-to-run, so an
+       * unwritten read inherits bistable content. */
+      if (getenv("WGPU_POOL_CLEAR")) {
+        static_cast<WebGPUTexture *>(t)->clear(double4(0.0));
+      }
       return t;
     }
   }
@@ -75,26 +94,32 @@ Texture *WebGPUTexturePool::acquire_texture_impl(int3 extent,
     default:
       break;
   }
-  acquired_.add(texture, 1);
+  acquired_.add(texture, 0);
   return texture;
 }
 
 void WebGPUTexturePool::offset_users_count(Texture *tex, int offset)
 {
+  /* VALIDATION COUNTER ONLY — upstream (gpu_texture_pool.cc) semantics.
+   * TextureFromPool::retain() calls this with -1 meaning "keep me alive into
+   * the next cycle"; a texture only returns to the free list via an explicit
+   * release_texture(). The previous refcount-style implementation FREED the
+   * texture when the count hit zero, so retain() (DoF stabilize history,
+   * raytrace denoise histories) put live textures back in the pool — two
+   * users then shared one texture, and two writable bindings of the same
+   * subresource kill the whole command buffer on WebGPU. */
   int *users = acquired_.lookup_ptr(tex);
   if (users == nullptr) {
     return;
   }
   *users += offset;
-  if (*users <= 0) {
-    acquired_.remove(tex);
-    pool_.append({tex, 0});
-  }
 }
 
 void WebGPUTexturePool::release_texture(Texture *tex)
 {
-  offset_users_count(tex, -1);
+  if (acquired_.remove(tex)) {
+    pool_.append({tex, 0});
+  }
 }
 
 void WebGPUTexturePool::reset(bool force_free)

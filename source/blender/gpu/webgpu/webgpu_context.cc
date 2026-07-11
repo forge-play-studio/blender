@@ -46,11 +46,18 @@ namespace blender::gpu {
  * (render_pass_end path) instead of the film output (read_color_sync path), to
  * tell whether the world pass writes red or the film compute loses it.
  * Referenced via `extern` from webgpu_batch.cc. */
+long long g_stat_tex_bytes = 0;
+int g_stat_tex_count = 0;
 bool g_capture_debug_world = false;
 /* When true, the debug gbuffer-normal capture in webgpu_batch.cc owns the
  * capture buffer: the film read_color_sync capture is skipped so it can't
- * overwrite the bisect target. */
+ * overwrite the bisect target. Also enabled by ENV.WGPU_CAP_GBUF=1. */
 bool g_capture_debug_gbuf = false;
+bool wgpu_env_cap_gbuf()
+{
+  static const bool on = getenv("WGPU_CAP_GBUF") != nullptr;
+  return on || g_capture_debug_gbuf;
+}
 }  // namespace blender::gpu
 
 namespace {
@@ -237,6 +244,45 @@ void WebGPUContext::debug_capture_buffer(WGPUBuffer buf, size_t size)
   flush_encoder();
 }
 
+void WebGPUContext::debug_capture_stencil(WGPUTexture tex, uint32_t w, uint32_t h)
+{
+  if (tex == nullptr || device_ == nullptr) {
+    return;
+  }
+  const uint32_t bpr = (w + 255u) & ~255u; /* Stencil8: 1 byte/px, 256B row align. */
+  const size_t need = size_t(bpr) * h;
+  if (g_capture_buf == nullptr || g_capture_cap < need) {
+    if (g_capture_buf) {
+      wgpuBufferRelease(g_capture_buf);
+    }
+    WGPUBufferDescriptor bd = {};
+    bd.size = (need + 255) & ~size_t(255);
+    bd.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+    g_capture_buf = wgpuDeviceCreateBuffer(device_, &bd);
+    g_capture_cap = bd.size;
+  }
+  render_pass_end();
+  WGPUCommandEncoder enc = ensure_encoder();
+  if (enc == nullptr || g_capture_buf == nullptr) {
+    return;
+  }
+  WGPUTexelCopyTextureInfo src = {};
+  src.texture = tex;
+  src.aspect = WGPUTextureAspect_StencilOnly;
+  WGPUTexelCopyBufferInfo dst = {};
+  dst.buffer = g_capture_buf;
+  dst.layout.bytesPerRow = bpr;
+  dst.layout.rowsPerImage = h;
+  WGPUExtent3D ext = {w, h, 1};
+  wgpuCommandEncoderCopyTextureToBuffer(enc, &src, &dst, &ext);
+  g_capture_w = w;
+  g_capture_h = h;
+  g_capture_bpr = bpr;
+  g_capture_bpp = 1;
+  g_capture_ready = 0;
+  flush_encoder();
+}
+
 WGPUCommandEncoder WebGPUContext::ensure_encoder()
 {
   if (encoder_ == nullptr && device_ != nullptr) {
@@ -278,6 +324,7 @@ void WebGPUContext::render_pass_end()
     wgpuRenderPassEncoderRelease(render_pass_);
     render_pass_ = nullptr;
     render_pass_fb_ = nullptr;
+    pass_buffer_usage_.clear();
 
     /* Debug capture: copy the captured framebuffer's color into the persistent
      * readback buffer NOW, right after its render pass ends — the texture is
@@ -400,6 +447,51 @@ WGPUSampler WebGPUContext::default_sampler()
     default_sampler_ = wgpuDeviceCreateSampler(device_, &d);
   }
   return default_sampler_;
+}
+
+WGPUSampler WebGPUContext::sampler_for_state(GPUSamplerState state)
+{
+  if (device_ == nullptr) {
+    return nullptr;
+  }
+  /* Custom/internal states (icon, custom) keep the legacy default. */
+  if (state.type != GPU_SAMPLER_STATE_TYPE_PARAMETERS) {
+    return default_sampler();
+  }
+  const uint32_t key = uint32_t(state.filtering) | (uint32_t(state.extend_x) << 16) |
+                       (uint32_t(state.extend_yz) << 24);
+  if (WGPUSampler *cached = state_samplers_.lookup_ptr(key)) {
+    return *cached;
+  }
+  auto to_address = [](GPUSamplerExtendMode m) {
+    switch (m) {
+      case GPU_SAMPLER_EXTEND_MODE_REPEAT:
+        return WGPUAddressMode_Repeat;
+      case GPU_SAMPLER_EXTEND_MODE_MIRRORED_REPEAT:
+        return WGPUAddressMode_MirrorRepeat;
+      default:
+        /* EXTEND and CLAMP_TO_BORDER both clamp; border color is not supported
+         * in WebGPU (transparent-black border approximated by edge clamp). */
+        return WGPUAddressMode_ClampToEdge;
+    }
+  };
+  const bool linear = (state.filtering & GPU_SAMPLER_FILTERING_LINEAR) != 0;
+  const bool mip = (state.filtering & GPU_SAMPLER_FILTERING_MIPMAP) != 0;
+  const bool aniso = (state.filtering & GPU_SAMPLER_FILTERING_ANISOTROPIC_16) != 0;
+  WGPUSamplerDescriptor d = {};
+  d.addressModeU = to_address(state.extend_x);
+  d.addressModeV = to_address(state.extend_yz);
+  d.addressModeW = to_address(state.extend_yz);
+  d.magFilter = linear ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
+  d.minFilter = linear ? WGPUFilterMode_Linear : WGPUFilterMode_Nearest;
+  d.mipmapFilter = mip ? WGPUMipmapFilterMode_Linear : WGPUMipmapFilterMode_Nearest;
+  /* GL semantics: without the MIPMAP flag sampling stays on the base level. */
+  d.lodMaxClamp = mip ? 32.0f : 0.0f;
+  /* Anisotropy requires all-linear filters in WebGPU. */
+  d.maxAnisotropy = (aniso && linear && mip) ? 4 : 1;
+  WGPUSampler smp = wgpuDeviceCreateSampler(device_, &d);
+  state_samplers_.add(key, smp);
+  return smp;
 }
 
 WGPUTextureView WebGPUContext::dummy_storage_view(WGPUTextureFormat format,
@@ -737,9 +829,19 @@ WGPUBuffer WebGPUContext::null_attr_buffer()
     bd.label = {"null_attr", WGPU_STRLEN};
     bd.size = 64; /* >= largest vertex format (vec4<f32> = 16 B) at offset 0. */
     bd.usage = WGPUBufferUsage_Vertex | WGPUBufferUsage_CopyDst;
-    bd.mappedAtCreation = true; /* zero-initialized by spec; unmap keeps zeros */
+    bd.mappedAtCreation = true;
     null_attr_buffer_ = wgpuDeviceCreateBuffer(device_, &bd);
     if (null_attr_buffer_) {
+      /* GL's default for an unfed generic vertex attribute is (0, 0, 0, 1),
+       * and shaders DEPEND on w == 1 to detect a missing attribute (e.g.
+       * attr_load_orco: all-zero padding made every procedural texture read
+       * a constant generated coordinate -> flat). Replicate GL. */
+      float *w = static_cast<float *>(wgpuBufferGetMappedRange(null_attr_buffer_, 0, 64));
+      if (w != nullptr) {
+        for (int i = 0; i < 16; i++) {
+          w[i] = (i % 4 == 3) ? 1.0f : 0.0f;
+        }
+      }
       wgpuBufferUnmap(null_attr_buffer_);
     }
   }
@@ -1039,7 +1141,7 @@ void WebGPUContext::present_backbuffer(int w, int h)
     if (s_frame <= 8 || (s_frame % 60) == 0 || frame_ms > 25.0) {
       fprintf(stderr,
               "WGPU_STATS frame=%d dt=%.1fms submits=%d passes=%d bindgroups=%d bg_hits=%d "
-              "guard_flushes=%d fb_switches=%d\n",
+              "guard_flushes=%d fb_switches=%d tex=%d/%lldMB\n",
               s_frame,
               frame_ms,
               g_stat_submits,
@@ -1047,7 +1149,9 @@ void WebGPUContext::present_backbuffer(int w, int h)
               g_stat_bindgroups,
               g_stat_bg_hits,
               g_stat_flushes,
-              g_stat_fbswitch);
+              g_stat_fbswitch,
+              [] { extern int g_stat_tex_count; return g_stat_tex_count; }(),
+              [] { extern long long g_stat_tex_bytes; return g_stat_tex_bytes / (1024 * 1024); }());
       extern void webgpu_stat_flush_dump();
       webgpu_stat_flush_dump();
     }
@@ -1435,6 +1539,23 @@ WGPUBindGroup WebGPUContext::build_bind_group(WebGPUShader *shader,
          * filtering sampler — use the nearest sampler for those. */
         e.sampler = default_sampler();
         if (b.binding >= 128) {
+          /* Honor the GPUSamplerState captured at bind time for the paired
+           * texture slot (Closest interpolation, no-mip clamping, extend
+           * modes). One hardcoded linear+mip sampler made byte image textures
+           * sample low mips during magnification (tex_srgb_file purple mush /
+           * mr_elephant muddy-dark albedo). */
+          for (const WgslResourceBinding &tb : bindings) {
+            if (tb.binding != b.binding - 128 || tb.kind != WgslResourceBinding::TEXTURE) {
+              continue;
+            }
+            const ShaderInput *in_tex = iface ? iface->uniform_get(
+                                                    StringRefNull(tb.res_name.c_str())) :
+                                                nullptr;
+            if (in_tex != nullptr) {
+              e.sampler = sampler_for_state(bound_tex_state_get(in_tex->binding));
+            }
+            break;
+          }
           WebGPUTexture *paired = bound_texture_for_binding(iface, bindings, b.binding - 128);
           if (paired && paired->is_depth_format()) {
             e.sampler = nearest_sampler();
@@ -1598,6 +1719,26 @@ WGPUBindGroup WebGPUContext::build_bind_group(WebGPUShader *shader,
           fflush(stderr);
         }
         return nullptr;
+      }
+    }
+  }
+
+  /* Record this draw's SSBO buffers + writability for the per-pass usage
+   * conflict check (after alias/snapshot resolution — snapshots replace the
+   * bound buffer). See pass_buffer_usage_. */
+  pending_draw_buffers_.clear();
+  for (size_t i = 0; i < entries.size(); i++) {
+    if (entries[i].buffer != nullptr && bindings[i].kind == WgslResourceBinding::SSBO) {
+      const bool writable = bindings[i].buffer_type == WGPUBufferBindingType_Storage;
+      pending_draw_buffers_.emplace_back(entries[i].buffer, writable);
+      if (getenv("WGPU_LOG_SSBOUSE") && strstr(shader->name_get().c_str(), "MAV") != nullptr) {
+        fprintf(stderr,
+                "WGPU_SSBOUSE '%s' buf=%p w=%d res='%s'\n",
+                shader->name_get().c_str(),
+                (void *)entries[i].buffer,
+                int(writable),
+                bindings[i].res_name.c_str());
+        fflush(stderr);
       }
     }
   }
@@ -1873,12 +2014,15 @@ bool WebGPUContext::read_color_sync(WGPUTexture tex,
    * with this build's -fexceptions (see link_blender_web.sh). Enable with
    * ENV.WGPU_SYNC_READ=1 for experiments only. */
   static const bool sync_read_on = getenv("WGPU_SYNC_READ") != nullptr;
-  if (sync_read_on && channels < 4 && !g_capture_debug_world && !g_capture_debug_gbuf) {
+  if (sync_read_on && channels < 4 && !g_capture_debug_world && !wgpu_env_cap_gbuf()) {
     if (read_small_sync(tex, fmt, x, y, w, h, dst_format, channels, r_data, layer, mip)) {
       return true;
     }
   }
-  if (channels < 4 || g_capture_debug_world || g_capture_debug_gbuf) {
+  /* A raw SSBO debug capture must not be clobbered by the film readback. */
+  static const bool ssbo_cap_on = getenv("WGPU_CAP_SSBO_SHADER") != nullptr ||
+                                  getenv("WGPU_CAP_STENCIL") != nullptr;
+  if (channels < 4 || g_capture_debug_world || wgpu_env_cap_gbuf() || ssbo_cap_on) {
     if (r_data) { std::memset(r_data, 0, size_t(w) * size_t(h) * size_t(std::max(channels, 1)) *
                               (dst_format == GPU_DATA_FLOAT ? 4u : 1u)); }
     return false;

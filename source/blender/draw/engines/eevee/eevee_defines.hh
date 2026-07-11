@@ -139,7 +139,15 @@
 /* Ray-tracing. */
 #define RAYTRACE_GROUP_SIZE 8
 /* Keep this as a define to avoid shader variations. */
-#define RAYTRACE_RADIANCE_FORMAT UFLOAT_11_11_10
+#if defined(GPU_WEBGPU) || defined(__EMSCRIPTEN__)
+/* fast_gi_resolve does an in-place read_write on this format, and WebGPU only
+ * grants ReadWrite storage access to r32* (+ rgba16f-class with tier1) — not
+ * rg11b10ufloat. An invalid pipeline poisons its whole command buffer, so the
+ * cost is not "no GI" but a silently dropped frame chunk. Pay the 2x memory. */
+#  define RAYTRACE_RADIANCE_FORMAT SFLOAT_16_16_16_16
+#else
+#  define RAYTRACE_RADIANCE_FORMAT UFLOAT_11_11_10
+#endif
 #define RAYTRACE_RAYTIME_FORMAT SFLOAT_32
 #define RAYTRACE_VARIANCE_FORMAT SFLOAT_16
 #define RAYTRACE_TILEMASK_FORMAT UINT_8
@@ -254,6 +262,14 @@
 #define VOLUME_PROP_PHASE_IMG_SLOT 3
 #define VOLUME_PROP_PHASE_WEIGHT_IMG_SLOT 4
 #define VOLUME_OCCUPANCY_SLOT 5
+/* SSBO slots for the WebGPU occupancy migration (WGSL has no image atomics).
+ * 0-5 are taken by light/probe buffers in surf_volume; DRW owns 8-11, 14-15. */
+#define OCCUPANCY_BUF_SLOT 12
+#define VOLUME_HIT_COUNT_BUF_SLOT 13
+/* Prop accumulation SSBO (surf_volume only — occupancy shaders use 7 for hit
+ * counts; the two sets never meet in one shader). 12 floats per froxel. */
+#define VOLUME_PROP_BUF_SLOT 13
+#define VOLUME_PROP_BUF_STRIDE 12
 /* Only during volume pre-pass. */
 #define VOLUME_HIT_DEPTH_SLOT 0
 #define VOLUME_HIT_COUNT_SLOT 1

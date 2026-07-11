@@ -310,16 +310,29 @@ WGPURenderPassEncoder WebGPUFrameBuffer::begin_render_pass(WGPUCommandEncoder en
 
   {
     static int s_rp_log = 0;
-    if (s_rp_log < 300 && name_get()[0] != '&') {
+    /* ENV.WGPU_LOG_RP=1 lifts the startup-only cap (pass-structure debugging). */
+    if ((s_rp_log < 300 || getenv("WGPU_LOG_RP")) &&
+        (name_get()[0] != '&' || getenv("WGPU_LOG_RP"))) {
       s_rp_log++;
       fprintf(stderr,
-              "WGPU_RP '%s' colors=%d depth=%d dload=%d dclear=%.2f cload0=%d\n",
+              "WGPU_RP '%s' colors=%d depth=%d dload=%d dclear=%.2f cload0=%d "
+              "cclear0=%.2f,%.2f,%.2f,%.2f sz=%dx%d vp=%d,%d,%d,%d\n",
               name_get(),
               color_count,
               int(has_depth),
               has_depth ? int(depth_att.depthLoadOp) : -1,
               has_depth ? depth_att.depthClearValue : -1.0f,
-              color_count ? int(color_att[0].loadOp) : -1);
+              color_count ? int(color_att[0].loadOp) : -1,
+              color_count ? color_att[0].clearValue.r : -1.0,
+              color_count ? color_att[0].clearValue.g : -1.0,
+              color_count ? color_att[0].clearValue.b : -1.0,
+              color_count ? color_att[0].clearValue.a : -1.0,
+              width_,
+              height_,
+              viewport_[0],
+              viewport_[1],
+              viewport_[2],
+              viewport_[3]);
       fflush(stderr);
     }
   }

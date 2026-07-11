@@ -53,6 +53,10 @@ class WebGPUContext : public Context {
   WGPUBuffer bound_ubo_[WEBGPU_MAX_UBO] = {};
   WGPUBuffer bound_ssbo_[WEBGPU_MAX_SSBO] = {};
   WebGPUTexture *bound_tex_[WEBGPU_MAX_TEX] = {};
+  /* Sampler state captured at bind time (filtering/extend per unit). */
+  GPUSamplerState bound_tex_state_[WEBGPU_MAX_TEX] = {};
+  /* Cache: GPUSamplerState key -> WGPUSampler (see sampler_for_state). */
+  Map<uint32_t, WGPUSampler> state_samplers_;
   WebGPUTexture *bound_image_[WEBGPU_MAX_IMAGE] = {};
 
   /* Render-pipeline cache keyed by (shader, vertex/format/prim/target) hash. */
@@ -148,6 +152,38 @@ class WebGPUContext : public Context {
    * other active pass first). No-op without a device. */
   void render_pass_ensure(WebGPUFrameBuffer &fb);
   void render_pass_end();
+
+  /* Per-open-render-pass buffer usage tracking. WebGPU validates usage scopes
+   * per pass: a buffer bound WRITABLE by one draw and READ-ONLY by another in
+   * the same pass invalidates the whole command buffer (EEVEE's volume
+   * occupancy prepass -> material pass relies on GL barriers for this).
+   * build_bind_group() records the incoming draw's buffers; record_draw ends
+   * the open pass first when they conflict with what the pass already used. */
+  std::unordered_map<WGPUBuffer, bool> pass_buffer_usage_; /* buffer -> writable */
+  std::vector<std::pair<WGPUBuffer, bool>> pending_draw_buffers_;
+  bool pending_draw_conflicts()
+  {
+    for (const auto &pb : pending_draw_buffers_) {
+      auto it = pass_buffer_usage_.find(pb.first);
+      if (it != pass_buffer_usage_.end() && (it->second || pb.second) &&
+          it->second != pb.second) {
+        return true;
+      }
+    }
+    return false;
+  }
+  void commit_pending_draw_buffers()
+  {
+    for (const auto &pb : pending_draw_buffers_) {
+      auto it = pass_buffer_usage_.find(pb.first);
+      if (it == pass_buffer_usage_.end()) {
+        pass_buffer_usage_[pb.first] = pb.second;
+      }
+      else {
+        it->second = it->second || pb.second;
+      }
+    }
+  }
   /* Finish + submit the current command encoder (one command buffer per pass:
    * WebGPU drops the entire buffer when any one command is invalid). */
   void flush_encoder();
@@ -197,9 +233,14 @@ class WebGPUContext : public Context {
   /* DEBUG: copy `size` bytes of `buf` into the persistent capture buffer (mapped
    * from JS after the render; h==1 marks it as a raw uint32 dump). */
   void debug_capture_buffer(WGPUBuffer buf, size_t size);
+  void debug_capture_stencil(WGPUTexture tex, uint32_t w, uint32_t h);
   WGPUBuffer bound_ssbo_get(int slot) const
   {
     return (slot >= 0 && slot < WEBGPU_MAX_SSBO) ? bound_ssbo_[slot] : nullptr;
+  }
+  WebGPUTexture *bound_image_get(int slot) const
+  {
+    return (slot >= 0 && slot < WEBGPU_MAX_IMAGE) ? bound_image_[slot] : nullptr;
   }
   WebGPUTexture *bound_tex_get(int slot) const
   {
@@ -430,6 +471,18 @@ class WebGPUContext : public Context {
       table_set(bound_ssbo_[slot], nullptr);
     }
   }
+  void bind_texture_state(int unit, GPUSamplerState state)
+  {
+    if (unit >= 0 && unit < WEBGPU_MAX_TEX) {
+      bound_tex_state_[unit] = state;
+    }
+  }
+  GPUSamplerState bound_tex_state_get(int slot) const
+  {
+    return (slot >= 0 && slot < WEBGPU_MAX_TEX) ? bound_tex_state_[slot] : GPUSamplerState();
+  }
+  /* Sampler matching a GPUSamplerState (cached; see webgpu_context.cc). */
+  WGPUSampler sampler_for_state(GPUSamplerState state);
   void bind_texture(int unit, WebGPUTexture *tex)
   {
     if (unit >= 0 && unit < WEBGPU_MAX_TEX) {

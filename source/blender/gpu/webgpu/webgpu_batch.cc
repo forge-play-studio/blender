@@ -126,6 +126,61 @@ static WGPUCompareFunction to_wgpu_depth_compare(GPUDepthTest t)
   }
 }
 
+/* Stencil state resolved from the pending GPU state. The reference value is
+ * dynamic (SetStencilReference); everything else bakes into the pipeline. */
+struct WGPUStencilParams {
+  bool enabled = false;
+  WGPUStencilFaceState front = {WGPUCompareFunction_Always,
+                                WGPUStencilOperation_Keep,
+                                WGPUStencilOperation_Keep,
+                                WGPUStencilOperation_Keep};
+  WGPUStencilFaceState back = {WGPUCompareFunction_Always,
+                               WGPUStencilOperation_Keep,
+                               WGPUStencilOperation_Keep,
+                               WGPUStencilOperation_Keep};
+  uint32_t read_mask = 0xFF;
+  uint32_t write_mask = 0;
+};
+
+static WGPUStencilParams to_wgpu_stencil(const GPUState &gst,
+                                         const GPUStateMutable &mst,
+                                         WGPUTextureFormat depth_fmt)
+{
+  WGPUStencilParams p;
+  const bool fmt_has_stencil = depth_fmt == WGPUTextureFormat_Depth24PlusStencil8 ||
+                               depth_fmt == WGPUTextureFormat_Depth32FloatStencil8;
+  const GPUStencilTest test = GPUStencilTest(gst.stencil_test);
+  if (!fmt_has_stencil || test == GPU_STENCIL_NONE) {
+    return p;
+  }
+  p.enabled = true;
+  const WGPUCompareFunction cmp = (test == GPU_STENCIL_EQUAL)  ? WGPUCompareFunction_Equal :
+                                  (test == GPU_STENCIL_NEQUAL) ? WGPUCompareFunction_NotEqual :
+                                                                 WGPUCompareFunction_Always;
+  p.front.compare = p.back.compare = cmp;
+  /* Semantics from gl_state.cc set_stencil_test. NOTE: our frontFace mapping
+   * already compensates the y-flip, so WGPU front == GL front here. */
+  switch (GPUStencilOp(gst.stencil_op)) {
+    case GPU_STENCIL_OP_REPLACE:
+      p.front.passOp = p.back.passOp = WGPUStencilOperation_Replace;
+      break;
+    case GPU_STENCIL_OP_COUNT_DEPTH_PASS:
+      p.back.passOp = WGPUStencilOperation_IncrementWrap;
+      p.front.passOp = WGPUStencilOperation_DecrementWrap;
+      break;
+    case GPU_STENCIL_OP_COUNT_DEPTH_FAIL:
+      p.back.depthFailOp = WGPUStencilOperation_DecrementWrap;
+      p.front.depthFailOp = WGPUStencilOperation_IncrementWrap;
+      break;
+    case GPU_STENCIL_OP_NONE:
+    default:
+      break;
+  }
+  p.read_mask = mst.stencil_compare_mask;
+  p.write_mask = (gst.write_mask & GPU_WRITE_STENCIL) ? mst.stencil_write_mask : 0;
+  return p;
+}
+
 /* Returns true when `blend` maps to a WGPU blend state (written to r_bs). */
 static bool to_wgpu_blend(GPUBlend blend, WGPUBlendState &r_bs)
 {
@@ -206,9 +261,35 @@ static bool to_wgpu_blend(GPUBlend blend, WGPUBlendState &r_bs)
       r_bs.color = comp(WGPUBlendFactor_One, WGPUBlendFactor_Src1);
       r_bs.alpha = comp(WGPUBlendFactor_One, WGPUBlendFactor_Src1Alpha);
       return true;
-    default:
-      /* OIT/etc: not mapped yet; draw with blending disabled. */
+    case GPU_BLEND_OVERLAY_MASK_FROM_ALPHA:
+      /* dst *= (1 - src.a) — overlay masking (gl_state.cc ZERO/ONE_MINUS_SRC_ALPHA). */
+      r_bs.color = comp(WGPUBlendFactor_Zero, WGPUBlendFactor_OneMinusSrcAlpha);
+      r_bs.alpha = comp(WGPUBlendFactor_Zero, WGPUBlendFactor_OneMinusSrcAlpha);
+      return true;
+    case GPU_BLEND_TRANSPARENCY:
+      /* EEVEE transposed transparency accumulation (per-channel MRT targets:
+       * (radiance_ch, ..., transmittance_ch)): rgb accumulates behind-to-front
+       * as src + dst*src.a; alpha holds the transmittance PRODUCT dst.a*src.a.
+       * Unmapped, this fell to blending-DISABLED: every transparent surface
+       * REPLACED the accumulation, so only the last-drawn layer survived where
+       * transparent objects overlap (alpha_blend: first plane's tint erased
+       * over the second's footprint; single layers were exact). */
+      r_bs.color = comp(WGPUBlendFactor_One, WGPUBlendFactor_SrcAlpha);
+      r_bs.alpha = comp(WGPUBlendFactor_Zero, WGPUBlendFactor_SrcAlpha);
+      return true;
+    default: {
+      /* Silently disabling blending for an unmapped mode cost DAYS on
+       * GPU_BLEND_TRANSPARENCY (overlapping transparency replaced instead of
+       * accumulated, single layers pixel-perfect). Never again: log it. */
+      static int s_unmapped_logged = 0;
+      if (s_unmapped_logged < 8) {
+        s_unmapped_logged++;
+        fprintf(stderr, "WGPU_BLEND UNMAPPED mode=%d — drawing with blending DISABLED\n",
+                int(blend));
+        fflush(stderr);
+      }
       return false;
+    }
   }
 }
 
@@ -218,6 +299,16 @@ static void apply_viewport_scissor(WGPURenderPassEncoder pass, WebGPUFrameBuffer
 {
   const int2 size = fb->size_get();
   if (size.x <= 0 || size.y <= 0) {
+    return;
+  }
+  if (fb->multi_viewport()) {
+    /* gl_ViewportIndex emulation (EEVEE shadows): the shader applies the
+     * per-index rect itself; the hardware viewport must cover the full target.
+     * Using viewport_[0] here squeezed every shadow view into the first 256px
+     * corner — pages landed at wrong atlas texels and shadow_eval read empty
+     * pages (the "no cast shadows" bug). */
+    wgpuRenderPassEncoderSetViewport(
+        pass, 0.0f, 0.0f, float(size.x), float(size.y), 0.0f, 1.0f);
     return;
   }
   int vp[4];
@@ -321,6 +412,10 @@ void WebGPUBatch::record_draw(int vertex_first,
   std::vector<WGPUVertexBufferLayout> vb_layouts;
   std::vector<std::vector<WGPUVertexAttribute>> vb_attrs; /* stable storage */
   std::vector<WGPUBuffer> vb_buffers;
+  /* One shader location may match aliases in SEVERAL vbos (instancing vbos
+   * repeat mesh attribute names) — a location bound twice is a pipeline
+   * validation error. First matching vbo wins, like GL's bind order. */
+  uint32_t bound_locations = 0;
   for (int vi = 0; vi < GPU_BATCH_VBO_MAX_LEN; vi++) {
     VertBuf *vbo = verts_(vi);
     if (vbo == nullptr) {
@@ -331,21 +426,42 @@ void WebGPUBatch::record_draw(int vertex_first,
       continue;
     }
     const GPUVertFormat &fmt = vbo->format;
+    if (getenv("WGPU_LOG_ATTRS") && strstr(shader->name_get().c_str(), "MATP") != nullptr) {
+      fprintf(stderr, "WGPU_ATTR_VBO '%s' vbo%d:", shader->name_get().c_str(), vi);
+      for (uint ai = 0; ai < fmt.attr_len; ai++) {
+        for (uint ni = 0; ni < fmt.attrs[ai].name_len; ni++) {
+          fprintf(stderr, " %s", GPU_vertformat_attr_name_get(&fmt, &fmt.attrs[ai], ni));
+        }
+        fprintf(stderr, ai + 1 < fmt.attr_len ? " |" : "");
+      }
+      fprintf(stderr, "\n");
+      fflush(stderr);
+    }
     std::vector<WGPUVertexAttribute> attrs;
     for (uint ai = 0; ai < fmt.attr_len; ai++) {
       const GPUVertAttr &attr = fmt.attrs[ai];
-      /* Match the first attribute name against the shader interface. */
-      const char *name = GPU_vertformat_attr_name_get(&fmt, &attr, 0);
-      const ShaderInput *in = iface->attr_get(name);
-      if (in == nullptr || in->location < 0) {
-        continue;
+      /* Match EVERY alias name against the shader interface (mesh UV/color
+       * layers register hashed alias names after the base name; materials
+       * reference the alias — matching only name 0 left UVs unfed and
+       * zero-padded: every texture sampled at (0, 0)). GL binds each matching
+       * alias; mirror that, one vertex attribute per matched location. */
+      for (uint ni = 0; ni < attr.name_len; ni++) {
+        const char *name = GPU_vertformat_attr_name_get(&fmt, &attr, ni);
+        const ShaderInput *in = iface->attr_get(name);
+        if (in == nullptr || in->location < 0) {
+          continue;
+        }
+        if (in->location < 32 && (bound_locations & (1u << in->location))) {
+          continue;
+        }
+        bound_locations |= (in->location < 32) ? (1u << in->location) : 0;
+        WGPUVertexAttribute wa = {};
+        wa.format = to_wgpu_vertex_format(
+            attr.type.comp_type(), attr.type.comp_len(), attr.type.fetch_mode());
+        wa.offset = attr.offset;
+        wa.shaderLocation = uint32_t(in->location);
+        attrs.push_back(wa);
       }
-      WGPUVertexAttribute wa = {};
-      wa.format = to_wgpu_vertex_format(
-          attr.type.comp_type(), attr.type.comp_len(), attr.type.fetch_mode());
-      wa.offset = attr.offset;
-      wa.shaderLocation = uint32_t(in->location);
-      attrs.push_back(wa);
     }
     if (attrs.empty()) {
       continue;
@@ -378,6 +494,23 @@ void WebGPUBatch::record_draw(int vertex_first,
         wa.offset = 0;
         wa.shaderLocation = vin.location;
         pad.push_back(wa);
+        if (getenv("WGPU_LOG_ATTRS")) {
+          /* Which interface attr name owns this location? */
+          const char *owner = "?";
+          for (uint ii = 0; ii < iface->attr_len_; ii++) {
+            const ShaderInput *si = iface->inputs_ + ii;
+            if (si && si->location == int(vin.location)) {
+              owner = iface->input_name_get(si);
+              break;
+            }
+          }
+          fprintf(stderr,
+                  "WGPU_ATTR_PAD '%s' loc=%u name='%s'\n",
+                  shader->name_get().c_str(),
+                  vin.location,
+                  owner);
+          fflush(stderr);
+        }
       }
     }
     WGPUBuffer nb = pad.empty() ? nullptr : ctx->null_attr_buffer();
@@ -438,10 +571,47 @@ void WebGPUBatch::record_draw(int vertex_first,
 
   /* Pending DRW/GPU state that shapes the pipeline. */
   const GPUState &gst = ctx->state_manager->state;
-  const GPUDepthTest depth_test = GPUDepthTest(gst.depth_test);
+  GPUDepthTest depth_test = GPUDepthTest(gst.depth_test);
   const bool depth_write = (gst.write_mask & GPU_WRITE_DEPTH) != 0;
   const GPUBlend blend = GPUBlend(gst.blend);
+  /* DEBUG bisect: ENV.WGPU_TRANSP_NODEPTH=1 disables the depth test for
+   * dual-source (forward transparent) draws — discriminates depth-rejection
+   * bugs from blend/accumulation bugs. */
+  if (blend == GPU_BLEND_CUSTOM && getenv("WGPU_TRANSP_NODEPTH")) {
+    depth_test = GPU_DEPTH_ALWAYS;
+  }
   const GPUFaceCullTest cull = GPUFaceCullTest(gst.culling_test);
+  const GPUStateMutable &mst = ctx->state_manager->mutable_state;
+  const WGPUStencilParams stencil = to_wgpu_stencil(gst, mst, depth_fmt);
+  /* DEBUG: ENV.WGPU_LOG_DRAW=<fb-name substr> — draw sequence + depth/blend
+   * state for every draw targeting matching framebuffers. */
+  if (const char *dpat = getenv("WGPU_LOG_DRAW")) {
+    if (fb != nullptr && strstr(fb->name_get(), dpat) != nullptr) {
+      fprintf(stderr,
+              "WGPU_DRAW fb='%s' sh='%s' dtest=%d dwrite=%d blend=%d cull=%d\n",
+              fb->name_get(),
+              shader->name_get().c_str(),
+              int(depth_test),
+              int(depth_write),
+              int(blend),
+              int(cull));
+      fflush(stderr);
+    }
+  }
+  if (getenv("WGPU_LOG_STENCIL") && GPUStencilTest(gst.stencil_test) != GPU_STENCIL_NONE) {
+    fprintf(stderr,
+            "WGPU_STENCIL '%s' test=%d op=%d ref=0x%02x cmp_mask=0x%02x wr_mask=0x%02x "
+            "enabled=%d depth_fmt=%d\n",
+            shader->name_get().c_str(),
+            int(gst.stencil_test),
+            int(gst.stencil_op),
+            mst.stencil_reference,
+            mst.stencil_compare_mask,
+            mst.stencil_write_mask,
+            int(stencil.enabled),
+            int(depth_fmt));
+    fflush(stderr);
+  }
 
   uint64_t key = 1469598103934665603ull;
   void *sh_ptr = shader;
@@ -462,6 +632,7 @@ void WebGPUBatch::record_draw(int vertex_first,
   hash_append(key, &write_mask_bits, sizeof(write_mask_bits));
   hash_append(key, &blend, sizeof(blend));
   hash_append(key, &cull, sizeof(cull));
+  hash_append(key, &stencil, sizeof(stencil));
   for (const WGPUVertexBufferLayout &l : vb_layouts) {
     hash_append(key, &l.arrayStride, sizeof(l.arrayStride));
     for (size_t a = 0; a < l.attributeCount; a++) {
@@ -531,6 +702,10 @@ void WebGPUBatch::record_draw(int vertex_first,
       ds.format = depth_fmt;
       ds.depthWriteEnabled = depth_write ? WGPUOptionalBool_True : WGPUOptionalBool_False;
       ds.depthCompare = to_wgpu_depth_compare(depth_test);
+      ds.stencilFront = stencil.front;
+      ds.stencilBack = stencil.back;
+      ds.stencilReadMask = stencil.read_mask;
+      ds.stencilWriteMask = stencil.write_mask;
     }
 
     /* Explicit pipeline layout from the parsed WGSL bindings so the layout has
@@ -556,7 +731,9 @@ void WebGPUBatch::record_draw(int vertex_first,
      * EEVEE negated all shading normals (lights appeared to come from the view
      * direction). Our pipeline does not flip y in the vertex stage, so NDC
      * winding matches GL directly. */
-    rpd.primitive.frontFace = gst.invert_facing ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
+    /* The vertex wrapper negates gl_Position.y (GL bottom-up convention), which
+     * inverts screen-space winding — so the GL default CCW maps to CW here. */
+    rpd.primitive.frontFace = gst.invert_facing ? WGPUFrontFace_CCW : WGPUFrontFace_CW;
     rpd.primitive.cullMode = (cull == GPU_CULL_FRONT) ? WGPUCullMode_Front :
                              (cull == GPU_CULL_BACK)  ? WGPUCullMode_Back :
                                                         WGPUCullMode_None;
@@ -626,26 +803,106 @@ void WebGPUBatch::record_draw(int vertex_first,
    * readback; JS maps it via wgpu_capture_map). Must run BEFORE the pass opens
    * (read_color_sync submits). */
   if (const char *cap_pat = getenv("WGPU_CAP_TEX_SHADER")) {
-    if (strstr(shader->name_get().c_str(), cap_pat) != nullptr) {
+    /* WGPU_CAP_TEX_SKIP=<n>: ignore the first n matching draws (capture a
+     * later render's state). Each matching draw decrements. */
+    static int s_cap_skip = getenv("WGPU_CAP_TEX_SKIP") ? atoi(getenv("WGPU_CAP_TEX_SKIP")) : 0;
+    if (strstr(shader->name_get().c_str(), cap_pat) != nullptr && s_cap_skip-- <= 0) {
       const char *us = getenv("WGPU_CAP_TEX_UNIT");
-      WebGPUTexture *t = ctx->tex_at(us ? atoi(us) : 0);
+      int unit = us ? atoi(us) : 0;
+      /* WGPU_CAP_TEX_NAME resolves the flat WGSL unit via the interface (the
+       * create-info slot number is NOT the bind-table index for samplers). */
+      if (const char *un = getenv("WGPU_CAP_TEX_NAME")) {
+        const ShaderInput *si = iface->uniform_get(un);
+        if (si == nullptr) {
+          static int s_name_warn = 0;
+          if (s_name_warn++ < 3) {
+            fprintf(stderr, "WGPU_CAPTEX no uniform '%s' in '%s'\n", un,
+                    shader->name_get().c_str());
+          }
+          unit = -1;
+        }
+        else {
+          unit = si->binding;
+        }
+      }
+      WebGPUTexture *t = unit >= 0 ? ctx->tex_at(unit) : nullptr;
       if (t != nullptr && t->wgpu_texture() != nullptr) {
         fprintf(stderr,
                 "WGPU_CAPTEX '%s' unit=%d %dx%d fmt=%d\n",
                 shader->name_get().c_str(),
-                us ? atoi(us) : 0,
+                unit,
                 t->width_get(),
                 t->height_get(),
                 int(t->wgpu_format()));
         fflush(stderr);
+        const char *ls = getenv("WGPU_CAP_TEX_LAYER");
         ctx->read_color_sync(t->wgpu_texture(), t->wgpu_format(), 0, 0, t->width_get(),
-                             t->height_get(), GPU_DATA_FLOAT, 4, nullptr, 0, 0);
+                             t->height_get(), GPU_DATA_FLOAT, 4, nullptr, ls ? atoi(ls) : 0, 0);
+      }
+    }
+  }
+
+  /* DEBUG: ENV.WGPU_CAP_STENCIL=<shader substr> captures the depth
+   * attachment's STENCIL aspect right before that shader's first draw. */
+  if (const char *cap_pat = getenv("WGPU_CAP_STENCIL")) {
+    static int s_st_cap = 0;
+    if (s_st_cap == 0 && strstr(shader->name_get().c_str(), cap_pat) != nullptr) {
+      Texture *dt = fb->depth_tex();
+      if (dt != nullptr) {
+        s_st_cap = 1;
+        WebGPUTexture *wdt = static_cast<WebGPUTexture *>(dt);
+        fprintf(stderr,
+                "WGPU_CAPSTENCIL '%s' %dx%d\n",
+                shader->name_get().c_str(),
+                wdt->width_get(),
+                wdt->height_get());
+        fflush(stderr);
+        ctx->debug_capture_stencil(
+            wdt->wgpu_texture(), uint32_t(wdt->width_get()), uint32_t(wdt->height_get()));
+      }
+    }
+  }
+
+  /* DEBUG: ENV.WGPU_CAP_SSBO_SHADER=<substr> + WGPU_CAP_SSBO_NAME=<ssbo name>
+   * [+ WGPU_CAP_SSBO_BYTES=<n>] captures the named SSBO's GPU bytes when that
+   * shader draws (raw-word deferred capture; JS maps via wgpu_capture_map). */
+  if (const char *cap_pat = getenv("WGPU_CAP_SSBO_SHADER")) {
+    static int s_ssbo_cap = 0;
+    const char *nm = getenv("WGPU_CAP_SSBO_NAME");
+    if (s_ssbo_cap == 0 && nm && strstr(shader->name_get().c_str(), cap_pat) != nullptr) {
+      const ShaderInput *si = iface->ssbo_get(nm);
+      WGPUBuffer sb = si ? ctx->ssbo_at(si->location) : nullptr;
+      if (sb != nullptr) {
+        s_ssbo_cap = 1;
+        const char *bs = getenv("WGPU_CAP_SSBO_BYTES");
+        size_t nbytes = bs ? size_t(atoi(bs)) : 256;
+        nbytes = std::min(nbytes, size_t(wgpuBufferGetSize(sb)));
+        fprintf(stderr,
+                "WGPU_CAPSSBO '%s' ssbo='%s' slot=%d size=%llu cap=%zu\n",
+                shader->name_get().c_str(),
+                nm,
+                si->location,
+                (unsigned long long)wgpuBufferGetSize(sb),
+                nbytes);
+        fflush(stderr);
+        ctx->debug_capture_buffer(sb, nbytes);
       }
     }
   }
 
   /* --- Begin render pass + record draw. --- */
+  if (ctx->pending_draw_conflicts()) {
+    /* This draw binds a buffer the open pass already used with different
+     * writability (e.g. volume occupancy: prepass writes, material reads).
+     * WebGPU usage scopes are per pass — split so both stay valid. */
+    if (getenv("WGPU_LOG_RP")) {
+      fprintf(stderr, "WGPU_SPLIT conflict '%s'\n", shader->name_get().c_str());
+      fflush(stderr);
+    }
+    ctx->render_pass_end();
+  }
   ctx->render_pass_ensure(*fb);
+  ctx->commit_pending_draw_buffers();
   WGPURenderPassEncoder pass = ctx->render_pass();
   if (pass == nullptr) {
     if (bg) {
@@ -655,6 +912,18 @@ void WebGPUBatch::record_draw(int vertex_first,
     return;
   }
   apply_viewport_scissor(pass, fb);
+  if (stencil.enabled) {
+    wgpuRenderPassEncoderSetStencilReference(pass, mst.stencil_reference);
+    if (getenv("WGPU_LOG_STENCIL")) {
+      fprintf(stderr,
+              "WGPU_SREF '%s' ref=0x%02x test=%d spec=%llx\n",
+              shader->name_get().c_str(),
+              mst.stencil_reference,
+              int(gst.stencil_test),
+              (unsigned long long)shader->spec_hash());
+      fflush(stderr);
+    }
+  }
 
   {
     static int s_mesh_state_log = 0;
@@ -737,8 +1006,16 @@ void WebGPUBatch::record_draw(int vertex_first,
       WebGPUIndexBuf *ibo = static_cast<WebGPUIndexBuf *>(elem_());
       const uint32_t index_count = (vertex_count > 0) ? uint32_t(vertex_count) :
                                                         ibo->index_len_get();
-      wgpuRenderPassEncoderDrawIndexed(
-          pass, index_count, uint32_t(instance_count), 0, 0, uint32_t(instance_first));
+      /* vertex_first = firstIndex for indexed draws (GPU_batch_draw_range
+       * semantics); index_base_ = baseVertex for min-index-compressed IBOs.
+       * Hardcoded zeros here shifted every sub-range indexed draw's attribute
+       * fetches (vertex_color_facet scrambling investigation). */
+      wgpuRenderPassEncoderDrawIndexed(pass,
+                                       index_count,
+                                       uint32_t(instance_count),
+                                       uint32_t(vertex_first),
+                                       ibo->index_base_get(),
+                                       uint32_t(instance_first));
     }
   }
   else {
@@ -791,10 +1068,11 @@ void WebGPUBatch::record_draw(int vertex_first,
     /* Debug bisect: capture the gbuffer NORMAL attachment (slot 2 of gbuffer_fb_)
      * right after the gbuffer content draw, to check whether the lit-face pepper
      * speckle originates in the gbuffer itself or in the deferred eval. */
-    extern bool g_capture_debug_gbuf;
-    if (g_capture_debug_gbuf && shname && strstr(shname, "deferred_light") != nullptr) {
+    extern bool wgpu_env_cap_gbuf();
+    if (wgpu_env_cap_gbuf() && shname && strstr(shname, "deferred_light") != nullptr) {
       /* Bisect: capture the direct radiance output of the light eval. */
-      const ShaderInput *si = iface->uniform_get("direct_radiance_1_img");
+      const char *img_name = getenv("WGPU_CAP_GBUF_IMG");
+      const ShaderInput *si = iface->uniform_get(img_name ? img_name : "direct_radiance_1_img");
       WebGPUTexture *nt = (si && si->binding >= 0) ? ctx->image_at(si->binding) : nullptr;
       if (nt != nullptr) {
         ctx->set_capture_target(nt);
@@ -971,6 +1249,8 @@ void webgpu_immediate_draw(GPUPrimType prim_type,
   const bool depth_write = (gst.write_mask & GPU_WRITE_DEPTH) != 0;
   const GPUBlend blend = GPUBlend(gst.blend);
   const GPUFaceCullTest cull = GPUFaceCullTest(gst.culling_test);
+  const GPUStateMutable &mst = ctx->state_manager->mutable_state;
+  const WGPUStencilParams stencil = to_wgpu_stencil(gst, mst, depth_fmt);
 
   uint64_t key = 1469598103934665603ull;
   void *sh_ptr = shader;
@@ -990,6 +1270,7 @@ void webgpu_immediate_draw(GPUPrimType prim_type,
   hash_append(key, &write_mask_bits, sizeof(write_mask_bits));
   hash_append(key, &blend, sizeof(blend));
   hash_append(key, &cull, sizeof(cull));
+  hash_append(key, &stencil, sizeof(stencil));
   for (uint32_t li = 0; li < layout_count; li++) {
     hash_append(key, &layouts[li].arrayStride, sizeof(layouts[li].arrayStride));
     for (size_t a = 0; a < layouts[li].attributeCount; a++) {
@@ -1055,6 +1336,10 @@ void webgpu_immediate_draw(GPUPrimType prim_type,
       ds.format = depth_fmt;
       ds.depthWriteEnabled = depth_write ? WGPUOptionalBool_True : WGPUOptionalBool_False;
       ds.depthCompare = to_wgpu_depth_compare(depth_test);
+      ds.stencilFront = stencil.front;
+      ds.stencilBack = stencil.back;
+      ds.stencilReadMask = stencil.read_mask;
+      ds.stencilWriteMask = stencil.write_mask;
     }
 
     WGPUBindGroupLayout bgl_explicit = ctx->make_bind_group_layout(
@@ -1071,7 +1356,9 @@ void webgpu_immediate_draw(GPUPrimType prim_type,
     rpd.vertex.constantCount = vert_consts.size();
     rpd.vertex.constants = vert_consts.empty() ? nullptr : vert_consts.data();
     rpd.primitive.topology = topo;
-    rpd.primitive.frontFace = gst.invert_facing ? WGPUFrontFace_CW : WGPUFrontFace_CCW;
+    /* The vertex wrapper negates gl_Position.y (GL bottom-up convention), which
+     * inverts screen-space winding — so the GL default CCW maps to CW here. */
+    rpd.primitive.frontFace = gst.invert_facing ? WGPUFrontFace_CCW : WGPUFrontFace_CW;
     rpd.primitive.cullMode = (cull == GPU_CULL_FRONT) ? WGPUCullMode_Front :
                              (cull == GPU_CULL_BACK)  ? WGPUCullMode_Back :
                                                         WGPUCullMode_None;
@@ -1104,7 +1391,11 @@ void webgpu_immediate_draw(GPUPrimType prim_type,
     return;
   }
 
+  if (ctx->pending_draw_conflicts()) {
+    ctx->render_pass_end();
+  }
   ctx->render_pass_ensure(*fb);
+  ctx->commit_pending_draw_buffers();
   WGPURenderPassEncoder pass = ctx->render_pass();
   if (pass == nullptr) {
     if (bg) {
@@ -1114,6 +1405,9 @@ void webgpu_immediate_draw(GPUPrimType prim_type,
     return;
   }
   apply_viewport_scissor(pass, fb);
+  if (stencil.enabled) {
+    wgpuRenderPassEncoderSetStencilReference(pass, mst.stencil_reference);
+  }
   ctx->occlusion_query_draw_hook();
   wgpuRenderPassEncoderSetPipeline(pass, pipeline);
   if (bg) {

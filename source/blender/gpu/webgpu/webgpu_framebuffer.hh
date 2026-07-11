@@ -90,6 +90,13 @@ class WebGPUFrameBuffer : public FrameBuffer {
   int color_attachment_count() const;
   WGPUTextureFormat color_format(int slot) const;
   WGPUTextureFormat depth_format() const; /* Undefined if none. */
+  /* True when per-index viewports were set (gl_ViewportIndex emulation): the
+   * hardware pass viewport must then stay the FULL target — the vertex shader
+   * scales clip coords per index itself. */
+  bool multi_viewport() const
+  {
+    return multi_viewport_;
+  }
 
  protected:
   void subpass_transition_impl(const GPUAttachmentState depth_attachment_state,

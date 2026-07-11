@@ -417,6 +417,11 @@ static std::string webgpu_glsl_patch(const char *stage_define)
    * viewports anchor at (0,0), so it reduces to an NDC scale). */
   ss << "int gpu_viewport_index_var = 0;\n";
   ss << "#define gpu_ViewportIndex gpu_viewport_index_var\n";
+  /* DEBUG bisect toggle: ENV.WGPU_PLAIN_STORE=1 restores the pre-min-emulation
+   * blind shadow-atlas store (eevee_surf_shadow.bsl.hh). */
+  if (getenv("WGPU_PLAIN_STORE")) {
+    ss << "#define WGPU_PLAIN_STORE_TEST\n";
+  }
   /* Tint's SPIR-V reader does not implement OpIsNan/OpIsInf — replace isnan/isinf
    * with manual expressions so glslang never emits those instructions. Use
    * type-overloaded helper functions (not a bare macro) so that VECTOR arguments
@@ -572,6 +577,12 @@ static bool glsl_to_wgsl(const std::string &glsl,
                          const char *name,
                          std::string &r_wgsl)
 {
+  if (const char *gpat = getenv("WGPU_DUMP_GLSL_STDERR")) {
+    if (strstr(name, gpat) != nullptr) {
+      fprintf(stderr, "GLSL_DUMP %s kind=%d\n%s\nGLSL_DUMP_END\n", name, int(kind), glsl.c_str());
+      fflush(stderr);
+    }
+  }
   shaderc::Compiler compiler;
   shaderc::CompileOptions opts;
   opts.SetTargetEnvironment(shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_0);

@@ -236,6 +236,10 @@ class WebGPUBackend : public GPUBackend {
     /* Build the bind group BEFORE opening the compute pass: assembly can record
      * copies/uploads (snapshot_for_sampling, lazy uploads) that must land
      * outside any pass. Compute also cannot be recorded inside a render pass. */
+    if (getenv("WGPU_LOG_RP") && ctx->render_pass() != nullptr) {
+      fprintf(stderr, "WGPU_SPLIT compute '%s'\n", sh->name_get().c_str());
+      fflush(stderr);
+    }
     ctx->render_pass_end();
     WGPUBindGroupLayout bgl = wgpuComputePipelineGetBindGroupLayout(pipe, 0);
     WGPUBindGroup bg = ctx->build_bind_group(sh, sh->compute_bindings(), bgl);
@@ -273,6 +277,287 @@ class WebGPUBackend : public GPUBackend {
     wgpuBindGroupLayoutRelease(bgl);
     /* Isolate this dispatch in its own command buffer (see flush_encoder). */
     ctx->flush_encoder();
+    debug_sum_ssbos(ctx, sh);
+  }
+  /* DEBUG: ENV.WGPU_SUM_SHADER=<substr> — after each matching dispatch, copy
+   * bound SSBO slots (and WGPU_SUM_TEX=<name substr> texture layers) into
+   * staging buffers and checksum them via ASYNC maps. Blocking maps need
+   * JSPI/Asyncify which this build lacks — async callbacks fire in queue
+   * completion order, so the seq tags keep prints attributable. Unlike
+   * WGPU_CAP_SSBO this does NOT suppress film output, so runs stay scoreable. */
+  struct DebugSumCtx {
+    WGPUBuffer st;
+    size_t size;
+    char tag[160];
+  };
+  static void debug_sum_async(WebGPUContext *ctx, const char *tag, WGPUBuffer st, size_t size)
+  {
+    DebugSumCtx *mc = new DebugSumCtx{st, size, {}};
+    snprintf(mc->tag, sizeof(mc->tag), "%s", tag);
+    WGPUBufferMapCallbackInfo cb = {};
+    cb.mode = WGPUCallbackMode_AllowSpontaneous;
+    cb.userdata1 = mc;
+    cb.callback = [](WGPUMapAsyncStatus status, WGPUStringView, void *ud1, void *) {
+      DebugSumCtx *mc = static_cast<DebugSumCtx *>(ud1);
+      if (status == WGPUMapAsyncStatus_Success) {
+        const uint32_t *v = static_cast<const uint32_t *>(
+            wgpuBufferGetConstMappedRange(mc->st, 0, mc->size));
+        if (v) {
+          uint32_t sum = 5381, nz = 0, nonfinite = 0;
+          for (size_t i = 0; i < mc->size / 4; i++) {
+            sum = sum * 33 + v[i];
+            nz += (v[i] != 0u);
+            /* Interpreted as f32: exponent all-ones = Inf/NaN. Also catches
+             * f16 pairs loosely via the high half (good enough for triage). */
+            nonfinite += ((v[i] & 0x7f800000u) == 0x7f800000u);
+            nonfinite += ((v[i] & 0x7c000000u) == 0x7c000000u); /* f16 hi */
+            nonfinite += ((v[i] & 0x00007c00u) == 0x00007c00u); /* f16 lo */
+          }
+          /* f16 max magnitude (treat words as 2x half): decode exponent/mantissa. */
+          float h16max = 0.0f;
+          for (size_t i = 0; i < mc->size / 4; i++) {
+            for (int hw = 0; hw < 2; hw++) {
+              const uint32_t h = (v[i] >> (hw * 16)) & 0xffffu;
+              const int e = int((h >> 10) & 0x1f);
+              const int m = int(h & 0x3ff);
+              if (e == 0x1f) {
+                continue; /* inf/nan counted above */
+              }
+              const float val = (e == 0) ? (m / 1024.0f) * 6.1e-5f :
+                                           (1.0f + m / 1024.0f) * exp2f(float(e - 15));
+              h16max = std::max(h16max, val);
+            }
+          }
+          fprintf(stderr, "WGPU_ASUM %s sum=%08x nz=%u nf=%u h16max=%.3g\n",
+                  mc->tag, sum, nz, nonfinite, h16max);
+          /* ENV.WGPU_DUMP_SSBO=<substr of tag>: hex-dump the first words to
+           * locate WHICH field diverges between runs. */
+          const char *dump = getenv("WGPU_DUMP_SSBO");
+          if (dump && strstr(mc->tag, dump)) {
+            const size_t n = std::min<size_t>(mc->size / 4, 128);
+            for (size_t i = 0; i < n; i += 8) {
+              fprintf(stderr,
+                      "WGPU_DUMP %s +%03zu %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                      mc->tag, i,
+                      v[i], v[i + 1], v[i + 2], v[i + 3],
+                      v[i + 4], v[i + 5], v[i + 6], v[i + 7]);
+            }
+          }
+          fflush(stderr);
+        }
+        wgpuBufferUnmap(mc->st);
+      }
+      else {
+        fprintf(stderr, "WGPU_ASUM %s MAP_FAILED st=%d\n", mc->tag, int(status));
+        fflush(stderr);
+      }
+      wgpuBufferRelease(mc->st);
+      delete mc;
+    };
+    wgpuBufferMapAsync(st, WGPUMapMode_Read, 0, size, cb);
+    (void)ctx;
+  }
+  static void debug_sum_ssbos(WebGPUContext *ctx, WebGPUShader *sh)
+  {
+    const char *pat = getenv("WGPU_SUM_SHADER");
+    const char *shader_name = sh->name_get().c_str();
+    if (pat == nullptr || strstr(shader_name, pat) == nullptr) {
+      return;
+    }
+    static int s_seq = 0;
+    const int seq = s_seq++;
+    char tag[160];
+    /* Only the SSBOs this shader DECLARES — the raw context bind table holds
+     * stale slots from earlier work, which fingerprint as phantom divergence. */
+    const ShaderInterface *iface = sh->interface;
+    const ShaderInput *ssbos = iface->inputs_ + iface->attr_len_ + iface->ubo_len_ +
+                               iface->uniform_len_;
+    for (uint i = 0; i < iface->ssbo_len_; i++) {
+      const ShaderInput *si = ssbos + i;
+      WGPUBuffer b = ctx->ssbo_at(si->location);
+      if (b == nullptr) {
+        continue;
+      }
+      const size_t sz = std::min<size_t>(size_t(wgpuBufferGetSize(b)), 262144);
+      const size_t asz = (sz + 3) & ~size_t(3);
+      WGPUBufferDescriptor bd = {};
+      bd.size = asz;
+      bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+      WGPUBuffer st = wgpuDeviceCreateBuffer(ctx->device(), &bd);
+      if (st == nullptr) {
+        continue;
+      }
+      WGPUCommandEncoder e2 = ctx->ensure_encoder();
+      if (e2 == nullptr) {
+        wgpuBufferRelease(st);
+        continue;
+      }
+      wgpuCommandEncoderCopyBufferToBuffer(e2, b, 0, st, 0, asz);
+      ctx->flush_encoder();
+      snprintf(tag,
+               sizeof(tag),
+               "#%d '%s' %s",
+               seq,
+               shader_name,
+               iface->input_name_get(si));
+      debug_sum_async(ctx, tag, st, asz);
+    }
+    if (getenv("WGPU_SUM_UBO")) {
+      /* Same as the SSBO capture but for the shader's declared UBOs — uniform
+       * inputs (dof_buf, view matrices) are invisible to texture probes yet
+       * fully determine per-pixel branches like DoF's focus classification. */
+      const ShaderInput *ubos = iface->inputs_ + iface->attr_len_;
+      for (uint i = 0; i < iface->ubo_len_; i++) {
+        const ShaderInput *ui = ubos + i;
+        /* UBOs: ->binding is the app slot (bound_ubo_ index); ->location is the
+         * flat WGSL binding (bind-group space). SSBOs have both == slot. */
+        WGPUBuffer b = ctx->ubo_at(ui->binding);
+        if (b == nullptr) {
+          continue;
+        }
+        if (!(wgpuBufferGetUsage(b) & WGPUBufferUsage_CopySrc)) {
+          /* Copying a non-CopySrc buffer fails validation and INVALIDATES the
+           * whole command buffer — every later pass in it would be dropped,
+           * turning the probe itself into the bug being chased. */
+          fprintf(stderr, "WGPU_ASUM #%d ubo '%s' NO_COPY_SRC\n", seq, iface->input_name_get(ui));
+          continue;
+        }
+        const size_t sz = std::min<size_t>(size_t(wgpuBufferGetSize(b)), 4096);
+        const size_t asz = (sz + 3) & ~size_t(3);
+        WGPUBufferDescriptor bd = {};
+        bd.size = asz;
+        bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+        WGPUBuffer st = wgpuDeviceCreateBuffer(ctx->device(), &bd);
+        if (st == nullptr) {
+          continue;
+        }
+        WGPUCommandEncoder e2 = ctx->ensure_encoder();
+        if (e2 == nullptr) {
+          wgpuBufferRelease(st);
+          continue;
+        }
+        wgpuCommandEncoderCopyBufferToBuffer(e2, b, 0, st, 0, asz);
+        ctx->flush_encoder();
+        snprintf(tag, sizeof(tag), "#%d ubo '%s'", seq, iface->input_name_get(ui));
+        debug_sum_async(ctx, tag, st, asz);
+      }
+    }
+    if (getenv("WGPU_SUM_BOUND")) {
+      /* Report THE SHADER'S declared texture bindings (raw bind-table slots
+       * include stale leftovers from other shaders — the classic trap). */
+      const ShaderInterface *bif = sh->interface;
+      for (uint i = 0; i < bif->uniform_len_; i++) {
+        const ShaderInput *in = bif->inputs_ + bif->attr_len_ + bif->ubo_len_ + i;
+        if (in->binding < 0 || in->binding >= 32) {
+          continue; /* Not a texture sampler slot. */
+        }
+        const char *bname = bif->input_name_get(in);
+        const size_t blen = strlen(bname);
+        /* Images and samplers share the uniform subarray; the slot spaces are
+         * separate, so the '_img' suffix alone misroutes names like
+         * out_radiance_mip0. Use the interface masks; suffix only breaks ties
+         * when a slot is enabled in both spaces. */
+        const bool suffix_img = blen > 4 && strcmp(bname + blen - 4, "_img") == 0;
+        const bool in_ima = in->binding < 8 && (bif->enabled_ima_mask_ >> in->binding) & 1;
+        const bool in_tex = (bif->enabled_tex_mask_ >> in->binding) & 1;
+        const bool is_img = in_ima && (!in_tex || suffix_img);
+        WebGPUTexture *bt = is_img ? ctx->bound_image_get(in->binding) :
+                                     ctx->bound_tex_get(in->binding);
+        fprintf(stderr, "WGPU_BOUND #%d '%s' %s=%d -> %s@%p wgpu=%p %dx%dx%d fmt=%d view=%d mip=%d layer=%d\n",
+                seq, bname, is_img ? "img" : "tex", in->binding,
+                bt ? bt->debug_name().c_str() : "NULL", (void *)bt,
+                bt ? (void *)bt->wgpu_texture() : nullptr,
+                bt ? bt->width_get() : 0, bt ? bt->height_get() : 0,
+                bt ? std::max(bt->depth_get(), 1) : 0,
+                (bt && bt->wgpu_texture()) ? int(wgpuTextureGetFormat(bt->wgpu_texture())) : -1,
+                bt ? int(bt->is_view()) : 0, bt ? bt->view_mip() : 0,
+                bt ? bt->view_layer() : 0);
+      }
+      fflush(stderr);
+    }
+    const char *tpat = getenv("WGPU_SUM_TEX");
+    const char *tfmt = getenv("WGPU_SUM_TEX_FMT"); /* Match by WGPUTextureFormat
+        int + depth>1 instead of name (DRW Texture members are often unnamed). */
+    if (tpat || tfmt) {
+      int tex_matches = 0;
+      /* Dispatch-level sampling gate (was inside the loop, capping captures
+       * to ONE texture per run). */
+      static int s_tex_nth = 0;
+      const char *nth_env = getenv("WGPU_SUM_TEX_NTH");
+      const int nth = nth_env ? atoi(nth_env) : 8;
+      const bool skip_this_dispatch = (s_tex_nth++ % std::max(nth, 1)) != 0;
+      extern std::vector<WebGPUTexture *> g_wgpu_live_textures;
+      for (WebGPUTexture *t : g_wgpu_live_textures) {
+        if (t->wgpu_texture() == nullptr) {
+          continue;
+        }
+        if (tfmt) {
+          if (int(wgpuTextureGetFormat(t->wgpu_texture())) != atoi(tfmt)) {
+            continue;
+          }
+        }
+        else if (strstr(t->debug_name().c_str(), tpat) == nullptr) {
+          continue;
+        }
+        /* Big textures (shadow atlas = 512MB): sample every Nth match, first
+         * WGPU_SUM_TEX_LAYERS layers only, one async staging buffer per layer. */
+        if (skip_this_dispatch) {
+          break;
+        }
+        const uint32_t w = uint32_t(std::max(t->width_get(), 1));
+        const uint32_t h = uint32_t(std::max(t->height_get(), 1));
+        const uint32_t layers = uint32_t(std::max(t->depth_get(), 1));
+        const char *lay_env = getenv("WGPU_SUM_TEX_LAYERS");
+        const uint32_t max_layers = std::min<uint32_t>(layers, lay_env ? atoi(lay_env) : 4);
+        extern uint32_t webgpu_format_bytes_per_pixel(WGPUTextureFormat f);
+        const uint32_t bpp = webgpu_format_bytes_per_pixel(
+            wgpuTextureGetFormat(t->wgpu_texture()));
+        const uint32_t arow = ((w * bpp) + 255u) & ~255u;
+        const uint64_t lsz = uint64_t(arow) * h;
+        if (lsz > (64u << 20)) {
+          break;
+        }
+        for (uint32_t l = 0; l < max_layers; l++) {
+          WGPUBufferDescriptor bd = {};
+          bd.size = lsz;
+          bd.usage = WGPUBufferUsage_MapRead | WGPUBufferUsage_CopyDst;
+          WGPUBuffer st = wgpuDeviceCreateBuffer(ctx->device(), &bd);
+          if (st == nullptr) {
+            break;
+          }
+          WGPUCommandEncoder e2 = ctx->ensure_encoder();
+          if (e2 == nullptr) {
+            wgpuBufferRelease(st);
+            break;
+          }
+          WGPUTexelCopyTextureInfo src = {};
+          src.texture = t->wgpu_texture();
+          src.origin = {0, 0, l};
+          WGPUTexelCopyBufferInfo dst = {};
+          dst.buffer = st;
+          dst.layout.bytesPerRow = arow;
+          dst.layout.rowsPerImage = h;
+          WGPUExtent3D ext = {w, h, 1};
+          wgpuCommandEncoderCopyTextureToBuffer(e2, &src, &dst, &ext);
+          ctx->flush_encoder();
+          snprintf(tag,
+                   sizeof(tag),
+                   "#%d tex%d '%s'@%p %ux%u l%u",
+                   seq,
+                   tex_matches,
+                   t->debug_name().c_str(),
+                   (void *)t,
+                   w,
+                   h,
+                   l);
+          debug_sum_async(ctx, tag, st, size_t(lsz));
+        }
+        const char *cap_env = getenv("WGPU_SUM_TEX_MAX");
+        if (++tex_matches >= (cap_env ? atoi(cap_env) : 8)) {
+          break; /* Cap per-dispatch texture captures. */
+        }
+      }
+    }
   }
   void compute_dispatch_indirect(StorageBuf *indirect_buf) override
   {
@@ -340,6 +625,7 @@ class WebGPUBackend : public GPUBackend {
     }
     wgpuBindGroupLayoutRelease(bgl);
     ctx->flush_encoder();
+    debug_sum_ssbos(ctx, sh);
   }
 
   Context *context_alloc(GHOST_IWindow *ghost_window, GHOST_IContext *ghost_context) override

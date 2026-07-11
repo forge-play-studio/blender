@@ -94,6 +94,8 @@ static bool webgpu_format_supports_storage(WGPUTextureFormat f, WGPUDevice devic
   static int tier1 = -1;
   if (tier1 < 0 && device != nullptr) {
     tier1 = wgpuDeviceHasFeature(device, WGPUFeatureName_TextureFormatsTier1) ? 1 : 0;
+    fprintf(stderr, "WGPU_TEX texture-formats-tier1=%d\n", tier1);
+    fflush(stderr);
   }
   if (tier1 == 1) {
     switch (f) {
@@ -159,6 +161,18 @@ static WGPUTextureUsage webgpu_texture_usage(eGPUTextureUsage usage,
   return flags;
 }
 
+bool WebGPUTexture::wgpu_usage_covers(eGPUTextureUsage req) const
+{
+  if (texture_ == nullptr) {
+    return true;
+  }
+  WebGPUContext *ctx = WebGPUContext::get();
+  WGPUDevice dev = ctx ? ctx->device() : nullptr;
+  const WGPUTextureUsage need = webgpu_texture_usage(
+      req, wgpuTextureGetFormat(texture_), dev);
+  return (wgpuTextureGetUsage(texture_) & need) == need;
+}
+
 /* Bytes per texel for the WebGPU formats produced by webgpu_texture_format().
  * Used to size queue writes (bytesPerRow). Defaults to 4 for unmapped formats. */
 uint32_t webgpu_format_bytes_per_pixel(WGPUTextureFormat f)
@@ -195,10 +209,25 @@ uint32_t webgpu_format_bytes_per_pixel(WGPUTextureFormat f)
   }
 }
 
-WebGPUTexture::WebGPUTexture(const char *name) : Texture(name) {}
+/* DEBUG registry so env-gated probes can find a live texture by name
+ * (WGPU_SUM_TEX). Single GPU thread — no locking. */
+std::vector<WebGPUTexture *> g_wgpu_live_textures;
+
+WebGPUTexture::WebGPUTexture(const char *name) : Texture(name)
+{
+  if (name && name_.empty()) {
+    /* Upstream only keeps names under G_DEBUG_GPU; keep them always — debug
+     * probes match by name and labels make validation errors attributable. */
+    name_ = name;
+  }
+  g_wgpu_live_textures.push_back(this);
+}
 
 WebGPUTexture::~WebGPUTexture()
 {
+  g_wgpu_live_textures.erase(
+      std::remove(g_wgpu_live_textures.begin(), g_wgpu_live_textures.end(), this),
+      g_wgpu_live_textures.end());
   WebGPUContext::scrub_texture_all_contexts(this);
   for (auto &kv : attachment_views_) {
     if (kv.second) {
@@ -208,11 +237,22 @@ WebGPUTexture::~WebGPUTexture()
   if (sample_view_) {
     wgpuTextureViewRelease(sample_view_);
   }
+  if (mip_range_view_) {
+    wgpuTextureViewRelease(mip_range_view_);
+  }
   if (storage_view_) {
     wgpuTextureViewRelease(storage_view_);
   }
   if (view_) {
     wgpuTextureViewRelease(view_);
+  }
+  {
+    extern long long g_stat_tex_bytes;
+    extern int g_stat_tex_count;
+    g_stat_tex_bytes -= alloc_bytes_;
+    if (alloc_bytes_ > 0) {
+      g_stat_tex_count--;
+    }
   }
   if (texture_) {
     /* Release only — NEVER wgpuTextureDestroy. Blender frees textures that
@@ -278,8 +318,27 @@ bool WebGPUTexture::init_internal()
   }
 
   texture_ = wgpuDeviceCreateTexture(ctx->device(), &desc);
+  if (getenv("WGPU_LOG_TEXCREATE")) {
+    fprintf(stderr, "WGPU_TEXCREATE '%s' %ux%ux%u fmt=%d usage=0x%x mips=%u\n",
+            name_.c_str(), desc.size.width, desc.size.height, desc.size.depthOrArrayLayers,
+            int(desc.format), unsigned(desc.usage), desc.mipLevelCount);
+    fflush(stderr);
+  }
   if (texture_ == nullptr) {
     return false;
+  }
+  {
+    /* Rough VRAM accounting for leak hunting (WGPU_STATS). */
+    extern long long g_stat_tex_bytes;
+    extern int g_stat_tex_count;
+    const uint32_t bpp = webgpu_format_bytes_per_pixel(wgpu_format_);
+    alloc_bytes_ = (long long)desc.size.width * desc.size.height *
+                   desc.size.depthOrArrayLayers * bpp;
+    if (desc.mipLevelCount > 1) {
+      alloc_bytes_ += alloc_bytes_ / 2; /* mip chain approx. */
+    }
+    g_stat_tex_bytes += alloc_bytes_;
+    g_stat_tex_count++;
   }
   WGPUTextureViewDescriptor vdesc = {};
   vdesc.format = wgpu_format_;
@@ -327,10 +386,49 @@ WGPUTextureView WebGPUTexture::wgpu_attachment_view(int layer, int mip)
   return v;
 }
 
+void WebGPUTexture::mip_range_set(int min, int max)
+{
+  min = std::max(min, 0);
+  if (min == mip_min_ && max == mip_max_) {
+    return;
+  }
+  mip_min_ = min;
+  mip_max_ = max;
+  if (mip_range_view_) {
+    wgpuTextureViewRelease(mip_range_view_);
+    mip_range_view_ = nullptr;
+  }
+}
+
 WGPUTextureView WebGPUTexture::wgpu_sample_view()
 {
   if (!webgpu_format_has_stencil(wgpu_format_)) {
-    return view_;
+    /* Honor the sampling mip window: Blender clamps to the mips it actually
+       uploaded/generated; the default view spans the full chain and samples
+       Dawn-zero-initialized levels (black blended in — file byte textures
+       rendered dark/muddy: tex_srgb_file scene). */
+    const int total = std::max(mipmaps_, 1);
+    const int lo = std::min(mip_min_, total - 1);
+    const int hi = (mip_max_ < 0) ? total - 1 : std::min(mip_max_, total - 1);
+    if (lo == 0 && hi == total - 1) {
+      return view_;
+    }
+    if (mip_range_view_ == nullptr && texture_ != nullptr) {
+      WGPUTextureViewDescriptor vd = {};
+      vd.format = wgpu_format_;
+      vd.dimension = (type_ & GPU_TEXTURE_3D)    ? WGPUTextureViewDimension_3D :
+                     (type_ & GPU_TEXTURE_CUBE)  ? WGPUTextureViewDimension_Cube :
+                     (type_ & GPU_TEXTURE_ARRAY) ? WGPUTextureViewDimension_2DArray :
+                                                   WGPUTextureViewDimension_2D;
+      vd.baseMipLevel = uint32_t(view_mip_ + lo);
+      vd.mipLevelCount = uint32_t(hi - lo + 1);
+      vd.baseArrayLayer = uint32_t(view_layer_);
+      vd.arrayLayerCount = (vd.dimension == WGPUTextureViewDimension_2DArray) ?
+                               uint32_t(std::max((type_ & GPU_TEXTURE_1D) ? h_ : d_, 1)) :
+                           (vd.dimension == WGPUTextureViewDimension_Cube) ? 6u : 1u;
+      mip_range_view_ = wgpuTextureCreateView(texture_, &vd);
+    }
+    return mip_range_view_ ? mip_range_view_ : view_;
   }
   if (sample_view_ == nullptr && texture_ != nullptr) {
     WGPUTextureViewDescriptor vd = {};
@@ -631,8 +729,9 @@ void WebGPUTexture::update_sub(int mip,
 
   WGPUTexelCopyTextureInfo dst = {};
   dst.texture = texture_;
-  dst.mipLevel = mip;
-  dst.origin = {uint32_t(offset[0]), uint32_t(offset[1]), uint32_t(offset[2])};
+  dst.mipLevel = uint32_t(mip + view_mip_);
+  const uint32_t layer_off = (type_ & GPU_TEXTURE_3D) ? 0u : uint32_t(view_layer_);
+  dst.origin = {uint32_t(offset[0]), uint32_t(offset[1]), uint32_t(offset[2]) + layer_off};
   WGPUTexelCopyBufferLayout layout = {};
   layout.offset = 0;
   layout.bytesPerRow = w * bpp;
@@ -641,11 +740,45 @@ void WebGPUTexture::update_sub(int mip,
   if (type_ & GPU_TEXTURE_1D) {
     /* Promoted 1D: the source's second axis (extent[1]/offset[1]) is the layer
      * axis; the memory layout (one w-texel row per layer) is unchanged. */
-    dst.origin = {uint32_t(offset[0]), 0, uint32_t(offset[1])};
+    dst.origin = {uint32_t(offset[0]), 0, uint32_t(offset[1]) + layer_off};
     wext = {w, 1, h};
     layout.rowsPerImage = 1;
   }
   const size_t byte_size = size_t(w) * bpp * h * d;
+  if (getenv("WGPU_UTILTX_SYNTH") && w == 64 && d == 20 && tmp != nullptr) {
+    /* Synthetic layer pattern: layer l filled with l/100 (fp16). */
+    uint16_t *th = static_cast<uint16_t *>(tmp);
+    for (uint32_t l = 0; l < d; l++) {
+      const uint16_t hv = math::float_to_half(float(l) * 0.01f);
+      for (size_t i = 0; i < size_t(w) * h * (bpp / 2); i++) {
+        th[size_t(l) * w * h * (bpp / 2) + i] = hv;
+      }
+    }
+    fprintf(stderr, "WGPU_UTILTX_SYNTH applied\n");
+    fflush(stderr);
+  }
+  if (getenv("WGPU_DUMP_UTILTX") && w == 64 && d == 20) {
+    const float *sf = static_cast<const float *>(data);
+    const uint16_t *uh = static_cast<const uint16_t *>(upload);
+    fprintf(stderr,
+            "WGPU_UTILTX up=%ux%ux%u bpp=%u src_px=%zu row_px=%u conv=%d src0=[%.4f %.4f %.4f "
+            "%.4f %.4f %.4f %.4f %.4f] dst0=[%04x %04x %04x %04x %04x %04x %04x %04x]\n",
+            w, h, d, bpp, src_px, src_row_px, int(upload != data),
+            sf[0], sf[1], sf[2], sf[3], sf[4], sf[5], sf[6], sf[7],
+            uh[0], uh[1], uh[2], uh[3], uh[4], uh[5], uh[6], uh[7]);
+    for (uint32_t l = 0; l < d; l += 1) {
+      const size_t off = size_t(l) * h * w * (bpp / 2); /* uint16 index of layer start. */
+      const float *sl = sf + size_t(l) * h * w * (src_px / 4);
+      fprintf(stderr,
+              "WGPU_UTILTX layer%u src=[%.4f %.4f %.4f %.4f] dst=[%04x %04x %04x %04x]\n",
+              l, sl[0], sl[1], sl[2], sl[3], uh[off], uh[off + 1], uh[off + 2], uh[off + 3]);
+    }
+    fflush(stderr);
+  }
+  /* WriteTexture executes before recorded-but-unsubmitted passes — flush so a
+   * mid-render texture update cannot retroactively clobber data that pending
+   * passes were recorded against (same hazard as the clear() zero-fill). */
+  ctx->flush_if_pass_open("tex_update");
   wgpuQueueWriteTexture(ctx->queue(), &dst, upload, byte_size, &layout, &wext);
   if (tmp) {
     free(tmp);
@@ -669,6 +802,10 @@ void WebGPUTexture::copy_to(Texture *dst_tex, IndexRange mip_levels)
   }
   /* Copies must not land inside an open pass, and must execute after any draws
    * already recorded into it. */
+  if (getenv("WGPU_LOG_RP") && ctx->render_pass() != nullptr) {
+    fprintf(stderr, "WGPU_SPLIT copy_to '%s'\n", name_.c_str());
+    fflush(stderr);
+  }
   ctx->render_pass_end();
   WGPUCommandEncoder enc = ctx->ensure_encoder();
   if (enc == nullptr) {
@@ -709,6 +846,10 @@ void WebGPUTexture::clear(const double4 data)
    * the whole command buffer at submit (dropping every valid draw recorded with
    * it). Route 3D clears through the upload path below. */
   if (!is_3d && (usage & WGPUTextureUsage_RenderAttachment)) {
+    if (getenv("WGPU_LOG_RP") && ctx->render_pass() != nullptr) {
+      fprintf(stderr, "WGPU_SPLIT tex_clear_rp '%s'\n", name_.c_str());
+      fflush(stderr);
+    }
     ctx->render_pass_end();
     WGPUCommandEncoder enc = ctx->ensure_encoder();
     if (enc == nullptr) {
@@ -751,16 +892,91 @@ void WebGPUTexture::clear(const double4 data)
     }
     return;
   }
-  if (data.x == 0.0 && data.y == 0.0 && data.z == 0.0 && data.w == 0.0 && !is_depth &&
-      ctx->queue() != nullptr)
-  {
-    /* Zero-fill upload for non-renderable (and 3D) textures. */
+  /* Texel-pattern fill for non-renderable (and 3D) textures: zero clears fill
+   * with memset-zero; non-zero clears replicate one converted texel (formats
+   * added as needed — a skipped clear leaves stale texels, e.g. volume
+   * hit-depth cleared to non-zero was silently dropped before). */
+  const bool is_zero = (data.x == 0.0 && data.y == 0.0 && data.z == 0.0 && data.w == 0.0);
+  uint8_t texel[16] = {0};
+  bool fill_supported = is_zero;
+  if (!is_zero && !is_depth) {
+    fill_supported = true;
+    switch (wgpu_format_) {
+      case WGPUTextureFormat_R32Uint:
+      case WGPUTextureFormat_R32Sint: {
+        const uint32_t v = uint32_t(data.x);
+        std::memcpy(texel, &v, 4);
+        break;
+      }
+      case WGPUTextureFormat_R32Float: {
+        const float v = float(data.x);
+        std::memcpy(texel, &v, 4);
+        break;
+      }
+      case WGPUTextureFormat_RGBA32Float: {
+        const float v[4] = {float(data.x), float(data.y), float(data.z), float(data.w)};
+        std::memcpy(texel, v, 16);
+        break;
+      }
+      case WGPUTextureFormat_R16Float:
+      case WGPUTextureFormat_RG16Float:
+      case WGPUTextureFormat_RGBA16Float: {
+        const uint16_t h[4] = {math::float_to_half(float(data.x)),
+                               math::float_to_half(float(data.y)),
+                               math::float_to_half(float(data.z)),
+                               math::float_to_half(float(data.w))};
+        std::memcpy(texel, h, 8);
+        break;
+      }
+      case WGPUTextureFormat_RG11B10Ufloat: {
+        auto uf11 = [](float v) -> uint32_t {
+          return (uint32_t(math::float_to_half(v > 0.0f ? v : 0.0f)) >> 4) & 0x7FFu;
+        };
+        auto uf10 = [](float v) -> uint32_t {
+          return (uint32_t(math::float_to_half(v > 0.0f ? v : 0.0f)) >> 5) & 0x3FFu;
+        };
+        const uint32_t dw = uf11(float(data.x)) | (uf11(float(data.y)) << 11) |
+                            (uf10(float(data.z)) << 22);
+        std::memcpy(texel, &dw, 4);
+        break;
+      }
+      default:
+        fill_supported = false;
+        break;
+    }
+  }
+  if (fill_supported && !is_depth && ctx->queue() != nullptr) {
+    /* MUST flush first: WriteTexture executes before any recorded-but-
+     * unsubmitted passes — an unguarded atlas clear raced the batched shadow
+     * passes (the once-per-render bimodal weak-shadow flake: whether the
+     * encoder happened to be flushed decided the clear/write order). */
+    ctx->flush_if_pass_open("tex_clear");
+    {
+      static int s_zc_log = 0;
+      if (s_zc_log < 48) {
+        s_zc_log++;
+        fprintf(stderr, "WGPU_ZCLEAR '%s' %dx%dx%d fmt=%d view=%d mip=%d layer=%d\n",
+                name_.c_str(), w_, h_, std::max(d_, 1), int(wgpu_format_), int(is_view_),
+                view_mip_, view_layer_);
+        fflush(stderr);
+      }
+    }
     const int depth_or_layers = std::max(d_, 1);
     const uint32_t bpp = webgpu_format_bytes_per_pixel(wgpu_format_);
     const size_t row = size_t(std::max(w_, 1)) * bpp;
     std::vector<uint8_t> zeros(row * size_t(std::max(h_, 1)) * size_t(depth_or_layers), 0);
+    if (!is_zero) {
+      for (size_t i = 0; i < zeros.size(); i += bpp) {
+        std::memcpy(zeros.data() + i, texel, bpp);
+      }
+    }
     WGPUTexelCopyTextureInfo dst = {};
     dst.texture = texture_;
+    /* Views share the parent WGPUTexture — without these offsets a mip-view
+     * clear stomps a zero rect into MIP 0 of the parent (this wiped baked
+     * sphere-probe atlas regions whenever the clear executed after the bake). */
+    dst.mipLevel = uint32_t(view_mip_);
+    dst.origin = {0, 0, is_3d ? 0u : uint32_t(view_layer_)};
     WGPUTexelCopyBufferLayout layout = {};
     layout.bytesPerRow = uint32_t(row);
     layout.rowsPerImage = uint32_t(std::max(h_, 1));
