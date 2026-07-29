@@ -98,6 +98,16 @@ void ResourceBind::execute() const
       GPU_uniformbuf_bind(is_reference ? *uniform_buf_ref : uniform_buf, slot);
       break;
     case ResourceBind::Type::StorageBuf:
+      /* DEBUG: ENV.WGPU_LOG_BIND=1 — identify the exact SSBO bind preceding a
+       * wasm OOB trap (last line before the crash names slot + pointers). */
+      if (getenv("WGPU_LOG_BIND")) {
+        fprintf(stderr,
+                "WGPU_BINDCMD ssbo slot=%d ref=%d ptr=%p\n",
+                slot,
+                int(is_reference),
+                is_reference ? (void *)*storage_buf_ref : (void *)storage_buf);
+        fflush(stderr);
+      }
       GPU_storagebuf_bind(is_reference ? *storage_buf_ref : storage_buf, slot);
       break;
     case ResourceBind::Type::UniformAsStorageBuf:

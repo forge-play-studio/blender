@@ -145,6 +145,20 @@ void light_eval_frag([[resource_table]] LightEval &srt,
   const Thickness thickness = reader.read_thickness(gbuf.header, texel);
   const uchar closure_count = gbuf.header.closure_len();
 
+#ifdef GPU_WEBGPU
+  /* WORKAROUND: WGSL has no early_fragment_tests, so the stencil-EQUAL test
+   * does NOT gate this shader's storage writes (it has no color outputs) —
+   * every variant would run on every pixel and the last write wins. Emulate
+   * the stencil test from the gbuffer header, which is what the stencil bits
+   * encode in the first place (see StencilBits and tile_classify). */
+  if (int(closure_count) != SRT_CONSTANT_light_closure_eval_count_reflect) {
+    return;
+  }
+  if (gbuf.header.has_transmission() != srt.use_transmission) {
+    return;
+  }
+#endif
+
   const ViewMatrices view = views.get(0);
 
   const float3 P = view.point_screen_to_world(float3(v_out.screen_uv, depth));
@@ -179,6 +193,8 @@ void light_eval_frag([[resource_table]] LightEval &srt,
   /* TODO(fclem): If transmission (no SSS) is present, we could reduce LIGHT_CLOSURE_EVAL_COUNT
    * by 1 for this evaluation and skip evaluating the transmission closure twice. */
   lights.eval_reflection(ctx, vPz);
+
+
 
   if (srt.use_transmission) {
     light::EvalCtx<true> ctx_tr = light::init_from_reflect_ctx(ctx);

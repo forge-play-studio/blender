@@ -1207,6 +1207,18 @@ bool ShadowModule::shadow_update_finished(int loop_count)
     return true;
   }
 
+#ifdef __EMSCRIPTEN__
+  /* StorageBuf::read() has no synchronous GPU readback on WebGPU/wasm: it
+   * returns the stale host mirror, so view_needed_count is garbage (this was
+   * the bimodal weak-shadow flake — garbage either crossed SHADOW_VIEW_MAX or
+   * not, deciding whether remaining tilemap LODs ever rendered). Loop the
+   * analytic worst case instead: each iteration renders up to SHADOW_VIEW_MAX
+   * of the max_updated_view_count potentially-tagged views; surplus
+   * iterations are no-ops (no tagged views left to select). loop_count is
+   * already incremented when called, so it equals iterations completed. */
+  return loop_count * SHADOW_VIEW_MAX >= max_updated_view_count;
+#endif
+
   /* Read back and check if there is still tile-map to update. */
   statistics_buf_.current().async_flush_to_host();
   statistics_buf_.current().read();
@@ -1322,6 +1334,16 @@ void ShadowModule::render(View &view, int2 extent)
 
   int loop_count = 0;
   do {
+#ifdef __EMSCRIPTEN__
+    if (getenv("WGPU_SHADOW_LOG")) {
+      fprintf(stderr,
+              "WGPU_SHADOW loop=%d tilemaps=%d max_views=%d\n",
+              loop_count,
+              int(tilemap_pool.tilemaps_data.size()),
+              int(tilemap_pool.tilemaps_data.size()) * SHADOW_TILEMAP_LOD);
+      fflush(stderr);
+    }
+#endif
     GPU_debug_group_begin("Shadow");
     {
       GPU_uniformbuf_clear_to_zero(shadow_multi_view_.matrices_ubo_get());

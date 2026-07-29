@@ -51,6 +51,10 @@ void comp_main([[resource_table]] Resources &srt,
     float depth = reverse_z::read(textureLod(srt.depth_tx, sample_uv, 0.0f).r);
     /* NOTE: We use samplers without filtering. */
     colors[i] = colorspace::safe_color(textureLod(srt.color_tx, sample_uv, 0.0f));
+    /* The forward transparent pass can leave garbage in combined ALPHA (its
+     * dual-source blend touches .a); DoF treats alpha as opacity/weight —
+     * bound it. (dof_heavy + any BLENDED surface rendered black frames.) */
+    colors[i].a = saturate(colors[i].a);
     cocs[i] = dof_coc_from_depth(views, srt.dof_buf, sample_uv, depth);
   }
 
@@ -173,7 +177,11 @@ struct Resources {
           int2 cache_texel = int2(local_id.xy) + offset;
           int2 load_texel = clamp(texel + offset - 1, int2(0), textureSize(color_tx, 0) - 1);
 
-          float4 color = texelFetch(color_tx, load_texel, 0);
+          /* First full-res read of the combined: scrub NaN here or one bad
+           * texel spreads through every downstream DoF gather (safe_color is
+           * bitwise NaN-proof — see eevee_colorspace_lib). */
+          float4 color = colorspace::safe_color(texelFetch(color_tx, load_texel, 0));
+          color.a = saturate(color.a);
           color_cache[cache_texel.y][cache_texel.x] = colorspace::YCoCg_from_scene_linear(color);
           coc_cache[cache_texel.y][cache_texel.x] = texelFetch(coc_tx, load_texel, 0).x;
         }

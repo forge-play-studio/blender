@@ -91,6 +91,18 @@ void surf_shadow([[resource_table]] PipelineConstants &pipe,
 
   int view_index = shadow_iface.shadow_view_id;
 
+#ifdef GPU_WEBGPU
+  /* The emulated viewport transform (NDC scale — see eevee_geom_*.bsl.hh)
+   * cannot CLIP like a hardware viewport: geometry past the view frustum
+   * over-rasterizes beyond the intended rect, landing on rendermap slots this
+   * view never wrote (stale from other samples/views) — valid-looking pages of
+   * OTHER tilemaps then receive garbage depth (triangular shadow wedges). */
+  if (any(greaterThanEqual(tile_co, int2(shadow_iface.shadow_viewport_tile_len)))) {
+    gpu_discard_fragment();
+    return;
+  }
+#endif
+
   int render_page_index = shadow_render_page_index_get(view_index, tile_co);
   uint page_packed = srt.render_map_buf[render_page_index];
 
@@ -114,11 +126,21 @@ void surf_shadow([[resource_table]] PipelineConstants &pipe,
   u_depth += 2;
 
 #ifdef GPU_WEBGPU
-  /* WGSL has no image atomics (Tint ICEs on OpImageTexelPointer). Plain store:
-   * overlapping fragments of the same page pick an arbitrary depth instead of
-   * the minimum — a mild self-shadowing bias, acceptable until a
-   * storage-buffer-backed atlas redesign. */
+  /* WGSL has no image atomics (Tint ICEs on OpImageTexelPointer), but r32ui IS
+   * a legal read_write storage format: emulate imageAtomicMin with a
+   * load-compare-store. NOT atomic — two overlapping fragments can both pass
+   * the compare and the later store wins — but the error is bounded by the
+   * depth gap between two near-minimal fragments. A blind imageStore here made
+   * the winner ARBITRARY: whichever clipmap view/primitive rasterized last
+   * erased closer occluders (the bimodal weak-shadow flake — the winner
+   * tracked the GPU-side render_view allocation order). */
+#  ifdef WGPU_PLAIN_STORE_TEST
   imageStore(srt.shadow_atlas_img, out_texel, uint4(u_depth));
+#  else
+  if (u_depth < imageLoad(srt.shadow_atlas_img, out_texel).r) {
+    imageStore(srt.shadow_atlas_img, out_texel, uint4(u_depth));
+  }
+#  endif
 #else
   if (uni.uniform_buf.shadow.use_debug_cost) {
     imageAtomicAdd(srt.shadow_atlas_img, out_texel, 1u);

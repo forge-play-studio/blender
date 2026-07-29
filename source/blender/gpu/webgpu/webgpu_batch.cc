@@ -311,6 +311,13 @@ static void apply_viewport_scissor(WGPURenderPassEncoder pass, WebGPUFrameBuffer
         pass, 0.0f, 0.0f, float(size.x), float(size.y), 0.0f, 1.0f);
     return;
   }
+  /* The window backbuffer stores content in GL's bottom-up row order and is
+   * flipped once at present (see webgpu_context present blit). Its GL y-bottom
+   * origin therefore maps directly to a WebGPU top-left offset — re-flipping it
+   * here double-counts the region's vertical offset, dropping overlays drawn
+   * straight to the window (e.g. the box-select marquee) below the cursor.
+   * Offscreen targets are never present-flipped, so they still need the flip. */
+  const bool flip_y = !fb->is_backbuffer();
   int vp[4];
   fb->viewport_get(vp);
   if (vp[2] > 0 && vp[3] > 0) {
@@ -319,7 +326,7 @@ static void apply_viewport_scissor(WGPURenderPassEncoder pass, WebGPUFrameBuffer
     int w = std::min(vp[2], size.x - x);
     int y_bottom = std::max(0, vp[1]);
     int h = std::min(vp[3], size.y - y_bottom);
-    int y = size.y - y_bottom - h;
+    int y = flip_y ? (size.y - y_bottom - h) : y_bottom;
     if (w > 0 && h > 0) {
       wgpuRenderPassEncoderSetViewport(pass, float(x), float(y), float(w), float(h), 0.0f, 1.0f);
     }
@@ -331,7 +338,7 @@ static void apply_viewport_scissor(WGPURenderPassEncoder pass, WebGPUFrameBuffer
     int w = std::min(sc[2], size.x - x);
     int y_bottom = std::max(0, sc[1]);
     int h = std::min(sc[3], size.y - y_bottom);
-    int y = size.y - y_bottom - h;
+    int y = flip_y ? (size.y - y_bottom - h) : y_bottom;
     if (w > 0 && h > 0) {
       wgpuRenderPassEncoderSetScissorRect(pass, uint32_t(x), uint32_t(y), uint32_t(w), uint32_t(h));
     }

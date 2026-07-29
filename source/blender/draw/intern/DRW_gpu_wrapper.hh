@@ -289,6 +289,12 @@ class UniformArrayBuffer : public detail::UniformCommon<T, len, false> {
     /* TODO(@fclem): We should map memory instead. */
     this->data_ = static_cast<T *>(
         MEM_new_uninitialized_aligned(len * sizeof(T), 16, this->name_));
+#ifdef __EMSCRIPTEN__
+    /* Struct padding in uninitialized host arrays uploads malloc residue to
+     * the GPU; run-to-run it is bistable and made renders nondeterministic on
+     * the WebGPU backend. Zero it once at alloc. */
+    memset(reinterpret_cast<void *>(this->data_), 0, len * sizeof(T));
+#endif
   }
   ~UniformArrayBuffer()
   {
@@ -337,6 +343,10 @@ class StorageArrayBuffer : public detail::StorageCommon<T, len, device_only> {
     /* TODO(@fclem): We should map memory instead. */
     this->data_ = static_cast<T *>(
         MEM_new_uninitialized_aligned(len * sizeof(T), 16, this->name_));
+#ifdef __EMSCRIPTEN__
+    /* See UniformArrayBuffer: zero to keep uploads deterministic. */
+    memset(reinterpret_cast<void *>(this->data_), 0, len * sizeof(T));
+#endif
   }
   ~StorageArrayBuffer()
   {
@@ -351,6 +361,10 @@ class StorageArrayBuffer : public detail::StorageCommon<T, len, device_only> {
       /* Manual realloc since MEM_realloc_uninitialized_aligned does not exists. */
       T *new_data_ = static_cast<T *>(
           MEM_new_uninitialized_aligned(new_size * sizeof(T), 16, this->name_));
+#ifdef __EMSCRIPTEN__
+      /* See UniformArrayBuffer: zero to keep uploads deterministic. */
+      memset(reinterpret_cast<void *>(new_data_), 0, new_size * sizeof(T));
+#endif
       memcpy(reinterpret_cast<void *>(new_data_),
              this->data_,
              min_uu(this->len_, new_size) * sizeof(T));

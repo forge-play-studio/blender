@@ -386,6 +386,17 @@ bool imb_oiio_write(const WriteContext &ctx, const char *filepath, const ImageSp
 
   bool write_ok = false;
   bool close_ok = false;
+#ifdef __EMSCRIPTEN__
+  if (getenv("IMB_DUMP_ATTRIBS")) {
+    for (const auto &a : file_spec.extra_attribs) {
+      fprintf(stderr,
+              "IMB_ATTR fmt=%s name='%s' type=%s\n",
+              ctx.file_format,
+              a.name().c_str(),
+              a.type().c_str());
+    }
+  }
+#endif
   if (out->open(filepath, file_spec)) {
     write_ok = final_buf.write(out.get());
     close_ok = out->close();

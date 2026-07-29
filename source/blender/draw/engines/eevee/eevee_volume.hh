@@ -73,6 +73,12 @@ class VolumeModule {
    * Using a 3D bit-field, we only allocate one bit per froxel.
    */
   Texture occupancy_tx_ = {"occupancy_tx"};
+  /* SSBO twins of the occupancy/hit-count images: WGSL has no image atomics,
+   * so the atomic passes use these buffers (same word layout as the images). */
+  StorageArrayBuffer<uint, 4, true> occupancy_buf_ = {"occupancy_buf"};
+  StorageArrayBuffer<uint, 4, true> hit_count_buf_ = {"hit_count_buf"};
+  /* Prop accumulation mirror (12 floats per froxel) — see eevee_surf_volume. */
+  StorageArrayBuffer<float, 4, true> volume_prop_buf_ = {"volume_prop_buf"};
   /**
    * List of surface hit for correct occupancy determination.
    * One texture holds the number of hit count and the other the depth and
@@ -199,15 +205,18 @@ class VolumeModule {
     gpu::Texture *phase_tx_ = nullptr;
     gpu::Texture *phase_weight_tx_ = nullptr;
     gpu::Texture *occupancy_tx_ = nullptr;
+    gpu::StorageBuf **occupancy_buf_ = nullptr;
+    gpu::StorageBuf **volume_prop_buf_ = nullptr;
 
     template<typename PassType> void bind_resources(PassType &pass)
     {
+      pass.bind_ssbo(VOLUME_PROP_BUF_SLOT, volume_prop_buf_);
       pass.bind_image(VOLUME_PROP_SCATTERING_IMG_SLOT, &scattering_tx_);
       pass.bind_image(VOLUME_PROP_EXTINCTION_IMG_SLOT, &extinction_tx_);
       pass.bind_image(VOLUME_PROP_EMISSION_IMG_SLOT, &emission_tx_);
       pass.bind_image(VOLUME_PROP_PHASE_IMG_SLOT, &phase_tx_);
       pass.bind_image(VOLUME_PROP_PHASE_WEIGHT_IMG_SLOT, &phase_weight_tx_);
-      pass.bind_image(VOLUME_OCCUPANCY_SLOT, &occupancy_tx_);
+      pass.bind_ssbo(OCCUPANCY_BUF_SLOT, occupancy_buf_);
     }
   } properties;
 
@@ -216,13 +225,14 @@ class VolumeModule {
     /** References to the textures in the module. */
     gpu::Texture *occupancy_tx_ = nullptr;
     gpu::Texture *hit_depth_tx_ = nullptr;
-    gpu::Texture *hit_count_tx_ = nullptr;
+    gpu::StorageBuf **occupancy_buf_ = nullptr;
+    gpu::StorageBuf **hit_count_buf_ = nullptr;
 
     template<typename PassType> void bind_resources(PassType &pass)
     {
-      pass.bind_image(VOLUME_OCCUPANCY_SLOT, &occupancy_tx_);
+      pass.bind_ssbo(OCCUPANCY_BUF_SLOT, occupancy_buf_);
       pass.bind_image(VOLUME_HIT_DEPTH_SLOT, &hit_depth_tx_);
-      pass.bind_image(VOLUME_HIT_COUNT_SLOT, &hit_count_tx_);
+      pass.bind_ssbo(VOLUME_HIT_COUNT_BUF_SLOT, hit_count_buf_);
     }
   } occupancy;
 };

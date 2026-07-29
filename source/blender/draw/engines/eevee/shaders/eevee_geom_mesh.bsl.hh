@@ -65,6 +65,9 @@ struct GeomMeshVertIn {
 
     shadow_iface.shadow_view_id = int(view_id);
     out_viewport = int(shadow.render_view_buf[view_id].viewport_index);
+    /* For the WebGPU emulated-viewport fragment clip (no hardware viewport
+     * clipping — see eevee_surf_shadow.bsl.hh). */
+    shadow_iface.shadow_viewport_tile_len = min(1 << out_viewport, SHADOW_TILEMAP_RES);
   }
 
   init_interface(id.raw_id);

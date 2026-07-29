@@ -128,6 +128,7 @@ template<bool is_transmission> struct EvalCtx {
     float attenuation = light_attenuation_surface(light, is_directional, lv);
     float facing = light_attenuation_facing(light, lv.L, lv.dist, stack.cl[0].N, is_transmission);
 
+
     if (!is_translucent_with_thickness) {
       /* Only do attenuation for this case, since we integrate the whole sphere for translucency.
        * Moreover, stack.cl[0].N is overwritten for is_translucent_with_thickness. */

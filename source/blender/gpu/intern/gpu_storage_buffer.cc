@@ -9,6 +9,7 @@
 #include "MEM_guardedalloc.h"
 #include <cstring>
 
+#include "BLI_set.hh"
 #include "BLI_string.hh"
 
 #include "BKE_global.hh"
@@ -29,14 +30,34 @@ namespace blender {
 
 namespace gpu {
 
+#ifdef __EMSCRIPTEN__
+/* Live-buffer registry: DRW passes capture StorageBuf** references at sync and
+ * can submit after the owner died (EEVEE world-volume pass captured a
+ * &ssbo_ whose owner was freed — the resolved pointer aliased a string).
+ * Native limps through such danglings; wasm hard-traps and kills the session.
+ * Single GPU thread — no locking. */
+static blender::Set<StorageBuf *> g_live_storage_bufs;
+
+bool storagebuf_is_live(StorageBuf *buf)
+{
+  return g_live_storage_bufs.contains(buf);
+}
+#endif
+
 StorageBuf::StorageBuf(size_t size, const char *name)
 {
   size_in_bytes_ = usage_size_in_bytes_ = size;
   STRNCPY(name_, name);
+#ifdef __EMSCRIPTEN__
+  g_live_storage_bufs.add(this);
+#endif
 }
 
 StorageBuf::~StorageBuf()
 {
+#ifdef __EMSCRIPTEN__
+  g_live_storage_bufs.remove(this);
+#endif
   MEM_SAFE_DELETE_VOID(data_);
 }
 
@@ -93,6 +114,27 @@ void GPU_storagebuf_update(gpu::StorageBuf *ssbo, const void *data)
 
 void GPU_storagebuf_bind(gpu::StorageBuf *ssbo, int slot)
 {
+  if (ssbo == nullptr) {
+    /* A pass synced in one state can submit in another where the resource
+     * reference resolves to null (e.g. EEVEE volume disable path). On native a
+     * null deref may limp along; on wasm it is a hard OOB trap that kills the
+     * session — skip the bind instead. */
+    return;
+  }
+#ifdef __EMSCRIPTEN__
+  if (!gpu::storagebuf_is_live(ssbo)) {
+    /* Dangling reference captured by a retained draw pass (see registry note
+     * in the ctor). Skip; log so the lifecycle bug stays visible. */
+    static int s_dangling_logged = 0;
+    if (s_dangling_logged < 16) {
+      s_dangling_logged++;
+      fprintf(stderr, "GPU_storagebuf_bind: DANGLING ssbo %p at slot %d — skipped\n",
+              (void *)ssbo, slot);
+      fflush(stderr);
+    }
+    return;
+  }
+#endif
   ssbo->bind(slot);
 }
 

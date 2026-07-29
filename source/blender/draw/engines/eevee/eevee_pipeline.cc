@@ -183,6 +183,7 @@ void WorldVolumePipeline::render(View &view)
     inst_.volume.prop_emission_tx_.clear(float4(0.0f));
     inst_.volume.prop_phase_tx_.clear(float4(0.0f));
     inst_.volume.prop_phase_weight_tx_.clear(float4(0.0f));
+    GPU_storagebuf_clear_to_zero(inst_.volume.volume_prop_buf_);
     return;
   }
 
@@ -911,6 +912,8 @@ void DeferredLayer::end_sync(bool is_first_pass,
         sub.bind_resources(inst_.sampling);
         sub.bind_texture("utility_tx", &inst_.pipelines.utility_tx);
         sub.bind_texture("gbuf_header_tx", &inst_.gbuffer.header_tx);
+        /* Sampled alias for reads — see ThicknessAmend in the shader. */
+        sub.bind_texture("gbuf_normal_tx", &inst_.gbuffer.normal_tx);
         sub.bind_image("gbuf_normal_img", &inst_.gbuffer.normal_tx);
         sub.state_set(DRW_STATE_WRITE_STENCIL | DRW_STATE_STENCIL_EQUAL);
         /* Render where there is transmission and the thickness from shadow bit is set. */
@@ -921,14 +924,21 @@ void DeferredLayer::end_sync(bool is_first_pass,
         sub.barrier(GPU_BARRIER_SHADER_IMAGE_ACCESS);
       }
       {
-        const bool use_transmission = (closure_bits_ & CLOSURE_TRANSMISSION) != 0;
+        const bool use_transmission = (closure_bits_ & CLOSURE_TRANSMISSION) != 0 &&
+                                      getenv("EEVEE_NO_TRANSMISSION") == nullptr;
         const bool use_split_indirect = do_split_direct_indirect_radiance(inst_);
         const bool use_lightprobe_eval = do_merge_direct_indirect_eval(inst_);
         PassSimple::Sub &sub = pass.sub("Eval.Light");
         /* Use depth test to reject background pixels which have not been stencil cleared. */
         /* WORKAROUND: Avoid rasterizer discard by enabling stencil write, but the shaders actually
          * use no fragment output. */
+#ifdef __EMSCRIPTEN__
+        /* EXPERIMENT: the WebGPU backend has no stencil support and the depth
+         * test kills all but an iso-depth arc — run on every pixel for now. */
+        sub.state_set(DRW_STATE_WRITE_STENCIL | DRW_STATE_STENCIL_EQUAL);
+#else
         sub.state_set(DRW_STATE_WRITE_STENCIL | DRW_STATE_STENCIL_EQUAL | DRW_STATE_DEPTH_LESS);
+#endif
         sub.bind_texture(RBUFS_UTILITY_TEX_SLOT, inst_.pipelines.utility_tx);
         sub.bind_image(RBUFS_COLOR_SLOT, &inst_.render_buffers.rp_color_tx);
         sub.bind_image(RBUFS_VALUE_SLOT, &inst_.render_buffers.rp_value_tx);
@@ -969,7 +979,7 @@ void DeferredLayer::end_sync(bool is_first_pass,
                                  uint8_t(StencilBits::TRANSMISSION);
           sub.state_stencil(0x0u, i + 1, compare_mask);
           sub.draw_procedural(GPU_PRIM_TRIS, 1, 3);
-          if (use_transmission) {
+          if (use_transmission && getenv("EEVEE_NO_TRANS_DRAW") == nullptr) {
             /* Separate pass for transmission BSDF as their evaluation is quite costly. */
             set_specialization_constants(sub, sh, true);
             sub.shader_set(sh);
@@ -1373,7 +1383,7 @@ void VolumeLayer::add_object_bound(const VolumeObjectBounds &object_bounds)
   combined_screen_bounds_ = bounds::merge(combined_screen_bounds_, object_bounds.screen_bounds);
 }
 
-void VolumeLayer::render(View &view, Texture &occupancy_tx)
+void VolumeLayer::render(View &view, gpu::StorageBuf *occupancy_buf)
 {
   if (is_empty) {
     return;
@@ -1383,12 +1393,12 @@ void VolumeLayer::render(View &view, Texture &occupancy_tx)
     if (use_hit_list) {
       /* Add resolve pass only when needed. Insert after occupancy, before material pass. */
       occupancy_ps_->shader_set(inst_.shaders.static_shader_get(VOLUME_OCCUPANCY_CONVERT));
-      occupancy_ps_->barrier(GPU_BARRIER_SHADER_IMAGE_ACCESS);
+      occupancy_ps_->barrier(GPU_BARRIER_SHADER_IMAGE_ACCESS | GPU_BARRIER_SHADER_STORAGE);
       occupancy_ps_->draw_procedural(GPU_PRIM_TRIS, 1, 3);
     }
   }
   /* TODO(fclem): Move this clear inside the render pass. */
-  occupancy_tx.clear(uint4(0u));
+  GPU_storagebuf_clear_to_zero(occupancy_buf);
   inst_.manager->submit(volume_layer_ps_, view);
 }
 
@@ -1408,10 +1418,10 @@ void VolumePipeline::sync()
   }
 }
 
-void VolumePipeline::render(View &view, Texture &occupancy_tx)
+void VolumePipeline::render(View &view, gpu::StorageBuf *occupancy_buf)
 {
   for (auto &layer : layers_) {
-    layer->render(view, occupancy_tx);
+    layer->render(view, occupancy_buf);
   }
 }
 

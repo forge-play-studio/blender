@@ -717,10 +717,16 @@ static void wm_step_apply_film_result(bContext *C)
   fflush(stderr);
 }
 
+/* Phase 2 of the web File ▸ Open flow: the page calls blender_web_file_open_at()
+ * (in wm_files.cc) once a picked folder finishes mounting; this drains that
+ * request on the proxied-main pthread and opens the file browser at the mount. */
+void wm_web_poll_pending_file_open(bContext *C);
+
 static void wm_main_step(void *arg)
 {
   bContext *C = static_cast<bContext *>(arg);
   wm_step_apply_film_result(C);
+  wm_web_poll_pending_file_open(C);
   /* Get events from ghost, handle window events, add to window queues. */
   wm_window_events_process(C);
   /* Per window, all events to the window, screen, area and region handlers. */

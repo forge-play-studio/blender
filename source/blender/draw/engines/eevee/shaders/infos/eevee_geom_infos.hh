@@ -43,6 +43,12 @@ GPU_SHADER_NAMED_INTERFACE_END(interp_flat)
 
 GPU_SHADER_NAMED_INTERFACE_INFO(eevee_surf_shadow_iface, shadow_iface)
 FLAT(int, shadow_view_id)
+/* WebGPU only (always present to keep layouts uniform): tile count of this
+ * view's viewport. The emulated viewport transform (NDC scale) cannot CLIP
+ * like a hardware viewport, so over-rasterized fragments past the intended
+ * rect must be discarded in the fragment shader (they land on stale rendermap
+ * slots and corrupt other tilemaps' pages). */
+FLAT(int, shadow_viewport_tile_len)
 GPU_SHADER_NAMED_INTERFACE_END(shadow_iface)
 
 GPU_SHADER_NAMED_INTERFACE_INFO(eevee_surf_shadow_clipping_iface, shadow_clip)

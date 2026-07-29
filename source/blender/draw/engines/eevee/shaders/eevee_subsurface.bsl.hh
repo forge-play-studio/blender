@@ -151,7 +151,13 @@ struct Convolve {
   void cache_populate(float2 local_uv, uint2 texel)
   {
     cached_radiance[texel.y][texel.x] = textureLod(radiance_tx, float3(local_uv, 0.0f), 0.0f).rgb;
+#ifdef GPU_WEBGPU
+    /* WGSL cannot sample integer textures; nearest-fetch is exact-equivalent. */
+    cached_sss_id[texel.y][texel.x] =
+        texelFetch(object_id_tx, int2(local_uv * float2(textureSize(object_id_tx, 0))), 0).r;
+#else
     cached_sss_id[texel.y][texel.x] = texture(object_id_tx, local_uv).r;
+#endif
     cached_depth[texel.y][texel.x] = reverse_z::read(texture(depth_tx, local_uv).r);
   }
 
@@ -177,7 +183,12 @@ struct Convolve {
       return samp;
     }
     samp.depth = reverse_z::read(texture(depth_tx, sample_uv).r);
+#ifdef GPU_WEBGPU
+    samp.sss_id = texelFetch(
+        object_id_tx, int2(sample_uv * float2(textureSize(object_id_tx, 0))), 0).r;
+#else
     samp.sss_id = texture(object_id_tx, sample_uv).r;
+#endif
     samp.radiance = textureLod(radiance_tx, float3(sample_uv, 0.0f), 0.0f).rgb;
     return samp;
   }

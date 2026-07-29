@@ -15,8 +15,11 @@ namespace eevee::volume::occupancy {
 struct Convert {
 
   [[image(VOLUME_HIT_DEPTH_SLOT, read, SFLOAT_32)]] const image3D hit_depth_img;
-  [[image(VOLUME_HIT_COUNT_SLOT, read_write, UINT_32)]] uimage2D hit_count_img;
-  [[image(VOLUME_OCCUPANCY_SLOT, read_write, UINT_32)]] uimage3DAtomic occupancy_img;
+  /* Storage buffers instead of R32UI images: WGSL has no image atomics and the
+   * hit counts are written with atomicAdd by surf_occupancy. Layouts match the
+   * old images (occupancy_buf_index). */
+  [[storage(VOLUME_HIT_COUNT_BUF_SLOT, read_write)]] uint (&hit_count_buf)[];
+  [[storage(OCCUPANCY_BUF_SLOT, read_write)]] uint (&occupancy_buf)[];
 };
 
 bool is_front_face_hit(float stored_hit_depth)
@@ -43,15 +46,17 @@ void convert_frag([[resource_table]] Convert &srt,
 
   int2 texel = int2(frag_co.xy);
 
-  int hit_count = int(imageLoad(srt.hit_count_img, texel).x);
+  const int2 fb_size = int2(uni.uniform_buf.volumes.tex_size.xy);
+  const int hit_count_index = ::occupancy::occupancy_buf_index(texel, 0, fb_size);
+  int hit_count = int(srt.hit_count_buf[hit_count_index]);
   hit_count = min(hit_count, VOLUME_HIT_DEPTH_MAX);
 
   if (hit_count == 0) {
     return;
   }
 
-  /* Clear the texture for next layer / frame. */
-  imageStore(srt.hit_count_img, texel, uint4(0));
+  /* Clear for next layer / frame. */
+  srt.hit_count_buf[hit_count_index] = 0u;
 
   for (int i = 0; i < hit_count; i++) {
     hit_depths[i] = imageLoad(srt.hit_depth_img, int3(texel, i)).r;
@@ -110,10 +115,12 @@ void convert_frag([[resource_table]] Convert &srt,
   }
 
   /* Write the occupancy bits */
-  for (int i = 0; i < imageSize(srt.occupancy_img).z; i++) {
+  const int layer_len = (int(uni.uniform_buf.volumes.tex_size.z) + 31) / 32;
+  for (int i = 0; i < layer_len; i++) {
     if (occupancy.bits[i] != 0u) {
       /* NOTE: Doesn't have to be atomic but we need to blend with other method. */
-      imageAtomicOr(srt.occupancy_img, int3(texel, i), occupancy.bits[i]);
+      atomicOr(srt.occupancy_buf[::occupancy::occupancy_buf_index(texel, i, fb_size)],
+               occupancy.bits[i]);
     }
   }
 }

@@ -8,6 +8,15 @@
 
 namespace occupancy {
 
+/* Flat index into the occupancy/hit-count SSBOs (WGSL has no image atomics —
+ * the R32UI occupancy images became storage buffers on this fork).
+ * Word layout matches the old 3D image: (layer * H + y) * W + x. */
+int occupancy_buf_index(int2 texel, int layer, int2 fb_size)
+{
+  return (layer * fb_size.y + texel.y) * fb_size.x + texel.x;
+}
+
+
 struct Bits {
   uint bits[8];
 };

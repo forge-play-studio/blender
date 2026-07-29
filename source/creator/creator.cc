@@ -8,9 +8,46 @@
 
 #include <cstdlib>
 #ifdef __EMSCRIPTEN__
+#  include <emscripten.h>
 #  include <emscripten/wasmfs.h>
 #  include <pthread.h>
 #  include <sys/stat.h>
+/* Zero-copy asset provider backend (demo/provider_backend.cpp, from gecko-wasm).
+ * Mounted at /assets when the demo sets BLENDER_WEB_ASSET_PROVIDER. */
+extern "C" backend_t wasmfs_create_provider_backend(int mountId);
+
+/* PROXY_TO_PTHREAD device bootstrap (demo/provider path only). gecko's async
+ * FsProvider requires the engine OFF the browser main thread, so the demo runs
+ * blender's main() on a pthread. But emdawnwebgpu WebGPU objects are per-thread
+ * JS objects: a device made on the main thread is unusable here. So acquire the
+ * device ON this pthread (async requestAdapter/requestDevice), stash it in this
+ * thread's Module.preinitializedWebGPUDevice (which the WebGPU backend then
+ * imports via emscripten_webgpu_get_device), and re-enter main(). blender's
+ * init is synchronous and can't await, so main() kicks the request off, keeps
+ * the runtime live, and returns; the spontaneous device callback re-invokes
+ * main() once the device is ready. */
+int main(int argc, const char **argv); /* forward decl for the re-entry below */
+static int g_web_bargc = 0;
+static const char **g_web_bargv = nullptr;
+static bool g_web_device_ready = false;
+extern "C" EMSCRIPTEN_KEEPALIVE void blender_web_device_ready()
+{
+  g_web_device_ready = true;
+  main(g_web_bargc, g_web_bargv);
+}
+
+/* Mount a JS FsProvider (Module.geckoProviders[mountId]) read-only at `path` at
+ * runtime — used by the drag-drop open-folder fallback (demo/src/main.js) so a
+ * dropped folder is read on demand through the ProviderBackend rather than
+ * copied. Returns 0 on success. */
+extern "C" EMSCRIPTEN_KEEPALIVE int blender_web_mount_provider(int mountId, const char *path)
+{
+  backend_t b = wasmfs_create_provider_backend(mountId);
+  if (b == nullptr) {
+    return -1;
+  }
+  return wasmfs_create_directory(path, 0555, b);
+}
 #endif
 #include <cstring>
 
@@ -344,6 +381,55 @@ int main(int argc,
 {
   using namespace blender;
 
+#ifdef __EMSCRIPTEN__
+  /* PROXY_TO_PTHREAD device bootstrap (see top of file). On first entry (demo
+   * provider mode, device not yet acquired on this pthread), asynchronously
+   * request an adapter+device HERE, stash it in this thread's
+   * Module.preinitializedWebGPUDevice, and re-enter main() from the callback.
+   * Same feature/limit request as demo/src/main.js. */
+  if (getenv("BLENDER_WEB_ASSET_PROVIDER") && !g_web_device_ready) {
+    g_web_bargc = argc;
+    g_web_bargv = argv;
+    EM_ASM({
+      (async () => {
+        try {
+          const adapter = await navigator.gpu.requestAdapter();
+          const wanted = ["dual-source-blending", "float32-filterable",
+            "rg11b10ufloat-renderable", "bgra8unorm-storage", "shader-f16",
+            "depth32float-stencil8", "texture-formats-tier1", "texture-formats-tier2",
+            "indirect-first-instance", "clip-distances"];
+          const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
+          const wantLimits = ["maxStorageTexturesPerShaderStage",
+            "maxStorageBuffersPerShaderStage", "maxSampledTexturesPerShaderStage",
+            "maxSamplersPerShaderStage", "maxUniformBuffersPerShaderStage",
+            "maxComputeWorkgroupSizeX", "maxComputeWorkgroupSizeY",
+            "maxComputeWorkgroupSizeZ", "maxComputeInvocationsPerWorkgroup",
+            "maxComputeWorkgroupStorageSize", "maxComputeWorkgroupsPerDimension",
+            "maxStorageBufferBindingSize", "maxUniformBufferBindingSize",
+            "maxBufferSize", "maxBindGroups", "maxBindingsPerBindGroup",
+            "maxTextureDimension2D", "maxTextureDimension3D", "maxTextureArrayLayers",
+            "maxColorAttachments", "maxColorAttachmentBytesPerSample"];
+          const requiredLimits = {};
+          for (const k of wantLimits) {
+            const v = adapter.limits[k];
+            if (v !== undefined) requiredLimits[k] = v;
+          }
+          Module["preinitializedWebGPUDevice"] =
+              await adapter.requestDevice({ requiredFeatures, requiredLimits });
+          _blender_web_device_ready();
+        }
+        catch (e) {
+          /* _blender_web_device_ready re-enters main(), which establishes the
+           * emscripten main loop by throwing 'unwind' — expected, not an error. */
+          if (e !== "unwind") console.error("pthread WebGPU device acquire failed:", e);
+        }
+      })();
+    });
+    emscripten_exit_with_live_runtime();
+    return 0;
+  }
+#endif
+
   bContext *C;
 #ifndef WITH_PYTHON_MODULE
   bArgs *ba;
@@ -396,6 +482,17 @@ int main(int argc,
     }
     else {
       fprintf(stderr, "BLENDER_WEB_OPFS: mount thread creation FAILED\n");
+    }
+  }
+  /* Zero-copy assets: mount the in-memory tar FsProvider at /assets before any
+   * asset is read (BLENDER_SYSTEM_RESOURCES/PYTHON point there). The provider
+   * (Module.geckoProviders[0], the decompressed tar indexed in demo/src/main.js)
+   * is served by the WasmFS ProviderBackend (demo/provider_backend.cpp +
+   * provider-fs.js, copied from gecko-wasm). Mirrors gecko's embed-init.cpp. */
+  if (getenv("BLENDER_WEB_ASSET_PROVIDER")) {
+    backend_t ab = wasmfs_create_provider_backend(0);
+    if (ab == nullptr || wasmfs_create_directory("/assets", 0555, ab) != 0) {
+      fprintf(stderr, "BLENDER_WEB_ASSET_PROVIDER: mounting /assets FAILED\n");
     }
   }
   /* wasmfs creates every --preload-file PARENT directory with a hardcoded

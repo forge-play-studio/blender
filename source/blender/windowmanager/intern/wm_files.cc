@@ -28,6 +28,12 @@
 #  include <shlobj.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+/* File ▸ Open pops the browser folder picker (MAIN_THREAD_ASYNC_EM_ASM). */
+#  include <emscripten/emscripten.h>
+#  include <emscripten/threading.h>
+#endif
+
 #include <fmt/format.h>
 
 #include "MEM_CacheLimiterC-Api.h"
@@ -540,6 +546,10 @@ static void wm_init_userdef(Main *bmain)
    * blocking the browser main thread deadlocks (the async map callback can
    * never run). Save without previews. */
   U.file_preview_type = USER_FILE_PREVIEW_NONE;
+  /* GPU (OpenSubdiv) subdivision evaluation does not run on the WebGPU
+   * backend yet — subdivision-surface modifiers rendered the un-subdivided
+   * base cage. Evaluate on the CPU (correct, slower). */
+  U.gpu_flag &= ~USER_GPU_FLAG_SUBDIVISION_EVALUATION;
 #endif
 
   ui::init_userdef();
@@ -3201,6 +3211,31 @@ enum {
 
 static wmOperatorStatus wm_open_mainfile_dispatch(bContext *C, wmOperator *op);
 
+#ifdef __EMSCRIPTEN__
+/* Two-phase File ▸ Open coordination (see wm_open_mainfile__select_file_path_exec).
+ * g_web_open_ready is true only during the phase-2 re-invoke driven by
+ * wm_web_poll_pending_file_open(); discard_changes_exec uses it to skip the
+ * unsaved-changes prompt (the user already answered it in phase 1). */
+static char g_web_open_path[1024] = {0};
+static volatile int g_web_open_pending = 0;
+static bool g_web_open_ready = false;
+
+/* Save mirrors Open. On Chromium with NO folder mounted yet, save first pops
+ * the folder picker (phase 1), then re-invokes to open Blender's save browser
+ * at the mount (phase 2). On Firefox/Safari (no File System Access API) save
+ * bypasses the browser entirely and downloads the .blend as a blob. */
+static char g_web_save_path[1024] = {0};
+static volatile int g_web_save_pending = 0;
+static bool g_web_save_ready = false;
+static bool g_web_has_mount = false;    /* a local folder is mounted at /mnt */
+static volatile int g_web_has_fsaccess = 1; /* set from JS: showDirectoryPicker present */
+
+extern "C" EMSCRIPTEN_KEEPALIVE void blender_web_set_has_fsaccess(int has)
+{
+  g_web_has_fsaccess = has;
+}
+#endif
+
 static void wm_open_mainfile_after_dialog_callback(bContext *C, void *user_data)
 {
   WM_operator_name_call_with_properties(C,
@@ -3219,11 +3254,75 @@ static wmOperatorStatus wm_open_mainfile__discard_changes_exec(bContext *C, wmOp
     set_next_operator_state(op, OPEN_MAINFILE_STATE_OPEN);
   }
 
+#ifdef __EMSCRIPTEN__
+  if (g_web_open_ready) {
+    /* Phase 2: the folder is picked+mounted and the unsaved-changes prompt was
+     * already answered in phase 1. Skip the close-file dialog (it would pop the
+     * "Don't Save" prompt again since nothing has been loaded yet) and go
+     * straight to opening the file browser. */
+    return wm_open_mainfile_dispatch(C, op);
+  }
+#endif
+
   if (wm_operator_close_file_dialog_if_needed(C, op, wm_open_mainfile_after_dialog_callback)) {
     return OPERATOR_INTERFACE;
   }
   return wm_open_mainfile_dispatch(C, op);
 }
+
+#ifdef __EMSCRIPTEN__
+extern "C" EMSCRIPTEN_KEEPALIVE void blender_web_file_open_at(const char *path)
+{
+  BLI_strncpy(g_web_open_path, (path && path[0]) ? path : "/mnt/", sizeof(g_web_open_path));
+  g_web_open_pending = 1;
+  g_web_has_mount = true; /* a local folder is now mounted at /mnt */
+}
+
+/* Phase 2 of the web Save flow: the page calls this once the destination folder
+ * finishes mounting (Chromium, no prior mount). Opens Blender's save browser. */
+extern "C" EMSCRIPTEN_KEEPALIVE void blender_web_file_save_at(const char *path)
+{
+  BLI_strncpy(g_web_save_path, (path && path[0]) ? path : "/mnt/", sizeof(g_web_save_path));
+  g_web_save_pending = 1;
+  g_web_has_mount = true;
+}
+
+/* Run an operator re-invoke with the first window's context set (this runs at
+ * the top of the main-loop tick, before event handling sets it). */
+static void wm_web_reinvoke_with_window(bContext *C, const char *opname, bool *ready_flag)
+{
+  wmWindowManager *wm = CTX_wm_manager(C);
+  if (wm == nullptr || BLI_listbase_is_empty(&wm->windows)) {
+    return;
+  }
+  wmWindow *win = static_cast<wmWindow *>(wm->windows.first);
+  wmWindow *prev_win = CTX_wm_window(C);
+  ScrArea *prev_area = CTX_wm_area(C);
+  ARegion *prev_region = CTX_wm_region(C);
+  CTX_wm_window_set(C, win);
+  *ready_flag = true;
+  WM_operator_name_call(C, opname, wm::OpCallContext::InvokeDefault, nullptr, nullptr);
+  *ready_flag = false; /* Defensive: never leak into an unrelated invoke. */
+  CTX_wm_window_set(C, prev_win);
+  CTX_wm_area_set(C, prev_area);
+  CTX_wm_region_set(C, prev_region);
+}
+
+void wm_web_poll_pending_file_open(bContext *C)
+{
+  if (g_web_open_pending) {
+    g_web_open_pending = 0;
+    /* Re-invoke Open; discard-changes → select-file-path opens the browser at
+     * g_web_open_path (phase 2). */
+    wm_web_reinvoke_with_window(C, "WM_OT_open_mainfile", &g_web_open_ready);
+  }
+  if (g_web_save_pending) {
+    g_web_save_pending = 0;
+    /* Re-invoke Save As; the invoke opens the save browser at g_web_save_path. */
+    wm_web_reinvoke_with_window(C, "WM_OT_save_as_mainfile", &g_web_save_ready);
+  }
+}
+#endif
 
 static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmOperator *op)
 {
@@ -3240,6 +3339,37 @@ static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmO
     return OPERATOR_CANCELLED;
   }
 
+#ifdef __EMSCRIPTEN__
+  /* Web build, two-phase File ▸ Open:
+   *   Phase 1 (fresh press): pop ONLY the browser's folder picker; do NOT open
+   *     Blender's file browser yet. The page lazily mounts the picked folder
+   *     under /mnt (demo/src/main.js `__blenderFileOpenHook`) and then calls
+   *     blender_web_file_open_at("/mnt/<folder>").
+   *   Phase 2 (re-invoked from wm_web_poll_pending_file_open once the mount is
+   *     done): g_web_open_ready is set, so we open the file browser pointed at
+   *     the freshly mounted folder.
+   * This keeps Blender's file browser hidden until a folder actually exists. */
+  UNUSED_VARS(blendfile_path);
+  if (g_web_open_ready) {
+    g_web_open_ready = false;
+    RNA_string_set(op->ptr, "filepath", g_web_open_path);
+    wm_open_init_load_ui(op, true);
+    wm_open_init_use_scripts(op, true);
+    op->customdata = nullptr;
+    WM_event_add_fileselect(C, op);
+    return OPERATOR_RUNNING_MODAL;
+  }
+  /* Phase 1: async so the picker runs on the browser main thread under the
+   * click's transient user activation (this exec is on the proxied-main
+   * pthread). Nothing is shown in Blender until phase 2. */
+  BLI_dir_create_recursive("/mnt");
+  MAIN_THREAD_ASYNC_EM_ASM({
+    if (typeof window !== "undefined" && window.__blenderFileOpenHook) {
+      window.__blenderFileOpenHook();
+    }
+  });
+  return OPERATOR_CANCELLED;
+#else
   /* If possible, get the name of the most recently used `.blend` file. */
   if (G.recent_files.first) {
     RecentFile *recent = static_cast<RecentFile *>(G.recent_files.first);
@@ -3247,6 +3377,7 @@ static wmOperatorStatus wm_open_mainfile__select_file_path_exec(bContext *C, wmO
   }
 
   RNA_string_set(op->ptr, "filepath", blendfile_path);
+#endif
   wm_open_init_load_ui(op, true);
   const bool use_scripts_autoexec_check = wm_open_init_use_scripts(op, true);
   UNUSED_VARS(use_scripts_autoexec_check); /* The user can set this in the UI. */
@@ -3958,6 +4089,87 @@ static void save_set_filepath(bContext *C, wmOperator *op)
   }
 }
 
+static wmOperatorStatus wm_save_as_mainfile_exec(bContext *C, wmOperator *op);
+#ifdef __EMSCRIPTEN__
+static bool wm_save_mainfile_check(bContext *C, wmOperator *op);
+#endif
+
+#ifdef __EMSCRIPTEN__
+/* Firefox/Safari save: no File System Access API and no lazy disk mount, so
+ * bypass the Blender file browser entirely — write the .blend to an in-memory
+ * temp path, then hand the bytes to the page to download as a blob. */
+static wmOperatorStatus wm_web_save_download(bContext *C, wmOperator *op)
+{
+  Main *bmain = CTX_data_main(C);
+  char name[FILE_MAXFILE];
+  const char *cur = BKE_main_blendfile_path(bmain);
+  if (cur && cur[0]) {
+    BLI_path_split_file_part(cur, name, sizeof(name));
+  }
+  else {
+    STRNCPY(name, "untitled.blend");
+  }
+  BLI_dir_create_recursive("/tmp/websave");
+  char filepath[FILE_MAX];
+  BLI_snprintf(filepath, sizeof(filepath), "/tmp/websave/%s", name);
+  RNA_string_set(op->ptr, "filepath", filepath);
+  save_set_compress(op);
+  wm_save_mainfile_check(C, op); /* ensure a .blend extension */
+  RNA_string_get(op->ptr, "filepath", filepath);
+
+  const wmOperatorStatus st = wm_save_as_mainfile_exec(C, op);
+  if (st == OPERATOR_FINISHED) {
+    MAIN_THREAD_ASYNC_EM_ASM(
+        {
+          if (typeof window !== "undefined" && window.__blenderSaveDownload) {
+            window.__blenderSaveDownload(UTF8ToString($0));
+          }
+        },
+        filepath);
+  }
+  return st;
+}
+
+/* Chromium save when a destination folder must be chosen. Returns true if it
+ * handled things (caller should return the given status); false to fall through
+ * to the normal Blender file browser (a folder is already mounted). */
+static bool wm_web_save_intercept(bContext *C, wmOperator *op, wmOperatorStatus *r_status)
+{
+  if (g_web_save_ready) {
+    /* Phase 2: folder just mounted — open the save browser inside it. */
+    g_web_save_ready = false;
+    if (g_web_save_path[0]) {
+      Main *bmain = CTX_data_main(C);
+      char name[FILE_MAXFILE];
+      const char *cur = BKE_main_blendfile_path(bmain);
+      if (cur && cur[0]) {
+        BLI_path_split_file_part(cur, name, sizeof(name));
+      }
+      else {
+        STRNCPY(name, "untitled.blend");
+      }
+      char filepath[FILE_MAX];
+      BLI_snprintf(filepath, sizeof(filepath), "%s%s", g_web_save_path, name);
+      RNA_string_set(op->ptr, "filepath", filepath);
+    }
+    return false; /* fall through: open the browser at the set filepath */
+  }
+  if (!g_web_has_mount) {
+    /* Phase 1: no folder mounted yet — pop the folder picker, defer the
+     * browser until blender_web_file_save_at() re-invokes us (phase 2). */
+    BLI_dir_create_recursive("/mnt");
+    MAIN_THREAD_ASYNC_EM_ASM({
+      if (typeof window !== "undefined" && window.__blenderSaveHook) {
+        window.__blenderSaveHook();
+      }
+    });
+    *r_status = OPERATOR_CANCELLED;
+    return true;
+  }
+  return false; /* a folder is mounted: normal browser */
+}
+#endif
+
 static wmOperatorStatus wm_save_as_mainfile_invoke(bContext *C,
                                                    wmOperator *op,
                                                    const wmEvent * /*event*/)
@@ -3973,6 +4185,12 @@ static wmOperatorStatus wm_save_as_mainfile_invoke(bContext *C,
     return OPERATOR_INTERFACE;
   }
 
+#ifdef __EMSCRIPTEN__
+  if (!g_web_has_fsaccess) {
+    return wm_web_save_download(C, op);
+  }
+#endif
+
   save_set_compress(op);
   save_set_filepath(C, op);
 
@@ -3980,6 +4198,15 @@ static wmOperatorStatus wm_save_as_mainfile_invoke(bContext *C,
   if (!RNA_property_is_set(op->ptr, prop)) {
     RNA_property_boolean_set(op->ptr, prop, (U.flag & USER_RELPATHS));
   }
+
+#ifdef __EMSCRIPTEN__
+  {
+    wmOperatorStatus web_status;
+    if (wm_web_save_intercept(C, op, &web_status)) {
+      return web_status;
+    }
+  }
+#endif
 
   WM_event_add_fileselect(C, op);
 
@@ -4233,6 +4460,13 @@ static wmOperatorStatus wm_save_mainfile_invoke(bContext *C,
     return OPERATOR_INTERFACE;
   }
 
+#ifdef __EMSCRIPTEN__
+  /* Firefox/Safari: no disk — every save (even "save in place") downloads. */
+  if (!g_web_has_fsaccess) {
+    return wm_web_save_download(C, op);
+  }
+#endif
+
   save_set_compress(op);
   save_set_filepath(C, op);
 
@@ -4257,6 +4491,15 @@ static wmOperatorStatus wm_save_mainfile_invoke(bContext *C,
     }
   }
   else {
+#ifdef __EMSCRIPTEN__
+    /* Chromium, unsaved file: if no folder is mounted, pop the folder picker
+     * first (phase 1) instead of the Blender browser; blender_web_file_save_at
+     * re-invokes Save As (phase 2). If a folder is mounted, fall through. */
+    wmOperatorStatus web_status;
+    if (wm_web_save_intercept(C, op, &web_status)) {
+      return web_status;
+    }
+#endif
     WM_event_add_fileselect(C, op);
     ret = OPERATOR_RUNNING_MODAL;
   }

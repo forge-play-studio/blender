@@ -94,7 +94,13 @@ namespace eevee {
 
 struct ThicknessAmend {
   [[sampler(0)]] usampler2DArray gbuf_header_tx;
-  [[image(0, read_write, UNORM_16_16)]] image2DArray gbuf_normal_img;
+  /* WORKAROUND: WebGPU has no read_write storage access for RG16Unorm. Read
+   * through a sampled binding instead (the WebGPU backend substitutes a
+   * snapshot copy when a texture aliases a storage image bind) and keep the
+   * storage image write-only. Semantics are preserved: each fragment reads
+   * only its own texel (and layer 0, which this pass never writes). */
+  [[sampler(GBUF_NORMAL_TEX_SLOT)]] sampler2DArray gbuf_normal_tx;
+  [[image(0, write, UNORM_16_16)]] image2DArray gbuf_normal_img;
 };
 
 struct VertOut {
@@ -132,10 +138,11 @@ void amend_frag([[resource_table]] ThicknessAmend &srt,
   const float3 P = view.point_screen_to_world(float3(v_out.uv, depth));
   const float vPz = dot(view.forward(), P) - dot(view.forward(), view.position());
 
-  const float3 Ng = gbuffer::normal_unpack(imageLoad(srt.gbuf_normal_img, int3(texel, 0)).rg);
+  const float3 Ng = gbuffer::normal_unpack(
+      texelFetch(srt.gbuf_normal_tx, int3(texel, 0), 0).rg);
 
   uchar data_layer = uni.pipeline_buf.gbuffer_additional_data_layer_id;
-  float2 data_packed = imageLoad(srt.gbuf_normal_img, int3(texel, int(data_layer))).rg;
+  float2 data_packed = texelFetch(srt.gbuf_normal_tx, int3(texel, int(data_layer)), 0).rg;
   Thickness gbuffer_thickness = gbuffer::thickness_unpack(data_packed.x);
   if (gbuffer_thickness.value() == 0.0f) {
     return;

@@ -131,6 +131,18 @@ void comp_main([[resource_table]] Resources &srt,
   float2 uv = frag_coord / float2(textureSize(srt.color_tx, 0));
   float2 uv_halfres = (frag_coord * 0.5f) / float2(textureSize(srt.color_bg_tx, 0));
 
+#ifdef GPU_WEBGPU
+  /* WORKAROUND: Tint's uniformity analysis rejects the workgroupBarrier inside
+   * this data-dependent branch. Hoist the call (it is workgroup-coherent);
+   * only consume the result under the original condition. */
+  float slight_focus_max_coc = srt.slight_focus_coc_tile_get(frag_coord, local_index);
+  if (prediction.do_slight_focus) {
+    prediction.do_slight_focus = slight_focus_max_coc >= 0.5f;
+    if (prediction.do_slight_focus) {
+      prediction.do_focus = false;
+    }
+  }
+#else
   float slight_focus_max_coc = 0.0f;
   if (prediction.do_slight_focus) {
     slight_focus_max_coc = srt.slight_focus_coc_tile_get(frag_coord, local_index);
@@ -139,6 +151,7 @@ void comp_main([[resource_table]] Resources &srt,
       prediction.do_focus = false;
     }
   }
+#endif
 
   if (prediction.do_focus) {
     float depth = reverse_z::read(textureLod(srt.depth_tx, uv, 0.0f).r);

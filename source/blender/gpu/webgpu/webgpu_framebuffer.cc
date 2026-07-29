@@ -44,6 +44,19 @@ void WebGPUFrameBuffer::bind(bool enabled_srgb)
       break;
     }
   }
+  /* Mirror the GL backend: when the attachment set changes, default the viewport
+   * and scissor to the full framebuffer. Callers that need a sub-rect set it
+   * explicitly afterwards (viewport_set only marks dirty_state_, not
+   * dirty_attachments_, so their value survives later binds). Without this the
+   * framebuffer's viewport_ stays {0,0,0,0}: GPU_viewport_size_get_f then reads
+   * back a zero size, and the polyline wide-line shader divides its screen-space
+   * edge expansion by that zero viewport -> NaN, so every overlay/gizmo wide line
+   * (e.g. the transform gizmo arrow stems) collapses and never renders. */
+  if (dirty_attachments_) {
+    viewport_reset();
+    scissor_reset();
+    dirty_attachments_ = false;
+  }
   Shader::set_framebuffer_srgb_target(enabled_srgb);
 }
 

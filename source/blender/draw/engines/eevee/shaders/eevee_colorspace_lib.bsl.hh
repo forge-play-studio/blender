@@ -78,11 +78,25 @@ float4 scene_linear_from_log(float4 color)
  */
 float4 safe_color(float4 c)
 {
-  return clamp(c, float4(0.0f), float4(1e20f));
+  /* Explicit NaN/Inf filtering via BIT INSPECTION: clamp() only removes NaN
+   * where hardware min/max return the non-NaN operand (typical GL drivers),
+   * and float-compare isnan() may be legally elided on WGSL (implementations
+   * can assume NaN-absent). Integer exponent tests cannot be optimized away.
+   * One NaN texel spreads frame-wide through the DoF gathers (mr_elephant:
+   * a single material's NaN blacked out every render). */
+  uint4 u = floatBitsToUint(c) & uint4(0x7fffffffu);
+  c = mix(c, float4(0.0f), greaterThanEqual(u, uint4(0x7f800000u)));
+  /* Clamp to HALF max, not 1e20: film/DoF intermediates are RGBA16F — 1e20
+   * becomes +INF on store, and INF arithmetic re-mints NaN downstream of
+   * every scrub (native GL hides this because hardware min/max keeps
+   * filtering NaN at each step; WGSL/Vulkan propagates). */
+  return clamp(c, float4(0.0f), float4(6.5e4f));
 }
 float3 safe_color(float3 c)
 {
-  return clamp(c, float3(0.0f), float3(1e20f));
+  uint3 u = floatBitsToUint(c) & uint3(0x7fffffffu);
+  c = mix(c, float3(0.0f), greaterThanEqual(u, uint3(0x7f800000u)));
+  return clamp(c, float3(0.0f), float3(6.5e4f));
 }
 
 /**

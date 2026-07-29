@@ -89,7 +89,14 @@ class GHOST_WindowWeb : public GHOST_Window {
   }
   void setTitle(const char *title) override
   {
-    EM_ASM({ document.title = UTF8ToString($0); }, title);
+    /* Runs on the render pthread under PROXY_TO_PTHREAD, where `document` does
+     * not exist — set the title on the browser main thread. Must be SYNCHRONOUS:
+     * `title` points into a caller-owned std::string that is destroyed as soon
+     * as this returns, so an async dispatch would UTF8ToString() a freed/reused
+     * buffer (garbage prefix). Synchronous proxying reads it while still valid.
+     * setTitle is only called on title refreshes (open/save/dirty), not per
+     * frame, so blocking the render thread briefly here is harmless. */
+    MAIN_THREAD_EM_ASM({ document.title = UTF8ToString($0); }, title);
   }
   std::string getTitle() const override
   {

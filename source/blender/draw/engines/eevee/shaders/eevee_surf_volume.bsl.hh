@@ -60,15 +60,22 @@ struct SurfVolume {
   [[legacy_info]] ShaderCreateInfo draw_modelmat_common;
   [[legacy_info]] ShaderCreateInfo eevee_geom_iface_info;
 
-  [[image(VOLUME_OCCUPANCY_SLOT, read, UINT_32)]] uimage3DAtomic occupancy_img;
+  /* SSBO instead of R32UI image — see occupancy_buf_index (WGSL image atomics). */
+  [[storage(OCCUPANCY_BUF_SLOT, read)]] const uint (&occupancy_buf)[];
+  /* Accumulation mirror of the prop images: WebGPU forbids read_write storage
+   * on RG11B10/R16F, so reads come from this buffer and the images stay
+   * write-only (the last store per froxel holds the accumulated value).
+   * Layout: VOLUME_PROP_BUF_STRIDE floats per froxel —
+   * scatter.xyz, extinction.xyz, emission.xyz, phase, phase_weight, pad. */
+  [[storage(VOLUME_PROP_BUF_SLOT, read_write)]] float (&volume_prop_buf)[];
 
-  [[image(
-      VOLUME_PROP_SCATTERING_IMG_SLOT, read_write, UFLOAT_11_11_10)]] image3D out_scattering_img;
-  [[image(
-      VOLUME_PROP_EXTINCTION_IMG_SLOT, read_write, UFLOAT_11_11_10)]] image3D out_extinction_img;
-  [[image(VOLUME_PROP_EMISSION_IMG_SLOT, read_write, UFLOAT_11_11_10)]] image3D out_emissive_img;
-  [[image(VOLUME_PROP_PHASE_IMG_SLOT, read_write, SFLOAT_16)]] image3D out_phase_img;
-  [[image(VOLUME_PROP_PHASE_WEIGHT_IMG_SLOT, read_write, SFLOAT_16)]] image3D out_phase_weight_img;
+  /* WRITE-only: reads go through volume_prop_buf (WebGPU forbids read_write
+   * storage on RG11B10/R16F formats). */
+  [[image(VOLUME_PROP_SCATTERING_IMG_SLOT, write, UFLOAT_11_11_10)]] image3D out_scattering_img;
+  [[image(VOLUME_PROP_EXTINCTION_IMG_SLOT, write, UFLOAT_11_11_10)]] image3D out_extinction_img;
+  [[image(VOLUME_PROP_EMISSION_IMG_SLOT, write, UFLOAT_11_11_10)]] image3D out_emissive_img;
+  [[image(VOLUME_PROP_PHASE_IMG_SLOT, write, SFLOAT_16)]] image3D out_phase_img;
+  [[image(VOLUME_PROP_PHASE_WEIGHT_IMG_SLOT, write, SFLOAT_16)]] image3D out_phase_weight_img;
 
   void write_froxel(int3 froxel, VolumeProperties prop)
   {
@@ -81,15 +88,34 @@ struct SurfVolume {
 
     float3 extinction = prop.scattering + prop.absorption;
 
+    const int2 vts = imageSize(out_scattering_img).xy;
+    const int accum = ((froxel.z * vts.y + froxel.y) * vts.x + froxel.x) *
+                      VOLUME_PROP_BUF_STRIDE;
     if (!is_world) [[static_branch]] {
       /* Additive Blending. No race condition since we have a barrier between each conflicting
-       * invocations. */
-      prop.scattering += imageLoadFast(out_scattering_img, froxel).rgb;
-      prop.emission += imageLoadFast(out_emissive_img, froxel).rgb;
-      extinction += imageLoadFast(out_extinction_img, froxel).rgb;
-      phase.x += imageLoadFast(out_phase_img, froxel).r;
-      phase.y += imageLoadFast(out_phase_weight_img, froxel).r;
+       * invocations. Reads go through the accumulation buffer: the images stay
+       * write-only (WebGPU forbids read_write storage on these formats). */
+      prop.scattering += float3(
+          volume_prop_buf[accum + 0], volume_prop_buf[accum + 1], volume_prop_buf[accum + 2]);
+      extinction += float3(
+          volume_prop_buf[accum + 3], volume_prop_buf[accum + 4], volume_prop_buf[accum + 5]);
+      prop.emission += float3(
+          volume_prop_buf[accum + 6], volume_prop_buf[accum + 7], volume_prop_buf[accum + 8]);
+      phase.x += volume_prop_buf[accum + 9];
+      phase.y += volume_prop_buf[accum + 10];
     }
+
+    volume_prop_buf[accum + 0] = prop.scattering.x;
+    volume_prop_buf[accum + 1] = prop.scattering.y;
+    volume_prop_buf[accum + 2] = prop.scattering.z;
+    volume_prop_buf[accum + 3] = extinction.x;
+    volume_prop_buf[accum + 4] = extinction.y;
+    volume_prop_buf[accum + 5] = extinction.z;
+    volume_prop_buf[accum + 6] = prop.emission.x;
+    volume_prop_buf[accum + 7] = prop.emission.y;
+    volume_prop_buf[accum + 8] = prop.emission.z;
+    volume_prop_buf[accum + 9] = phase.x;
+    volume_prop_buf[accum + 10] = phase.y;
 
     imageStoreFast(out_scattering_img, froxel, prop.scattering.xyzz);
     imageStoreFast(out_extinction_img, froxel, extinction.xyzz);
@@ -168,8 +194,14 @@ void surf_volume([[resource_table]] SurfVolume &srt,
   occupancy::Bits occupancy;
 
   if (!srt.is_world) [[static_branch]] {
+    /* The buffer only holds ceil(tex_size.z / 32) words per froxel column —
+     * unlike the old image, out-of-range reads are NOT defined-zero. */
+    const int layer_len = (int(uni.uniform_buf.volumes.tex_size.z) + 31) / 32;
     for (int j = 0; j < 8; j++) {
-      occupancy.bits[j] = imageLoad(srt.occupancy_img, int3(froxel.xy, j)).r;
+      occupancy.bits[j] = (j < layer_len) ?
+                              srt.occupancy_buf[::occupancy::occupancy_buf_index(
+                                  froxel.xy, j, int2(uni.uniform_buf.volumes.tex_size.xy))] :
+                              0u;
     }
   }
 

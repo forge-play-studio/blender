@@ -145,7 +145,11 @@ WebGPUContext::WebGPUContext(GHOST_IWindow * /*ghost_window*/,
    * render-to-texture (Cycles-style output, Workbench bring-up) this stays a
    * dummy until surface presentation is wired. */
   state_manager = new WebGPUStateManager();
-  back_left = active_fb = new WebGPUFrameBuffer("WebGPUBackbuffer");
+  {
+    WebGPUFrameBuffer *bb = new WebGPUFrameBuffer("WebGPUBackbuffer");
+    bb->set_is_backbuffer(true);
+    back_left = active_fb = bb;
+  }
   imm = new WebGPUImmediate();
   g_all_contexts.push_back(this);
 }
@@ -995,6 +999,15 @@ void WebGPUContext::backbuffer_ensure(int w, int h)
   fflush(stderr);
 }
 
+#ifdef __EMSCRIPTEN__
+/* First real frame: the demo splash/console stays up until Blender presents a
+ * frame that actually drew something. The initial present(s) are the startup
+ * clear — zero draw work (no bind groups); the first UI/viewport frame creates
+ * bind groups. We emit WGPU_FIRST_CONTENT on that frame and the page
+ * (demo/src/main.js) swaps the splash for the live canvas then. */
+static bool g_wgpu_content_signaled = false;
+#endif
+
 void WebGPUContext::present_backbuffer(int w, int h)
 {
   if (device_ == nullptr) {
@@ -1155,6 +1168,15 @@ void WebGPUContext::present_backbuffer(int w, int h)
       extern void webgpu_stat_flush_dump();
       webgpu_stat_flush_dump();
     }
+#ifdef __EMSCRIPTEN__
+    /* First frame with actual draw work (bind groups created) = first non-black
+     * frame; the startup clear has none. Signal the demo splash to reveal. */
+    if (!g_wgpu_content_signaled && g_stat_bindgroups > 0) {
+      g_wgpu_content_signaled = true;
+      fprintf(stderr, "WGPU_FIRST_CONTENT\n");
+      fflush(stderr);
+    }
+#endif
     g_stat_submits = g_stat_passes = g_stat_bindgroups = g_stat_flushes = g_stat_fbswitch =
         g_stat_bg_hits = 0;
   }

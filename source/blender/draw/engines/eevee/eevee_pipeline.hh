@@ -580,7 +580,7 @@ class VolumeLayer {
   void add_object_bound(const VolumeObjectBounds &object_bounds);
 
   void sync();
-  void render(View &view, Texture &occupancy_tx);
+  void render(View &view, gpu::StorageBuf *occupancy_buf);
 };
 
 class VolumePipeline {
@@ -599,7 +599,7 @@ class VolumePipeline {
   VolumePipeline(Instance &inst) : inst_(inst) {};
 
   void sync();
-  void render(View &view, Texture &occupancy_tx);
+  void render(View &view, gpu::StorageBuf *occupancy_buf);
 
   VolumeLayer *register_and_get_layer(const VolumeObjectBounds &object_bounds);
 

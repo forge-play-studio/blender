@@ -188,9 +188,17 @@ void VolumeModule::end_sync()
     properties.phase_tx_ = nullptr;
     properties.phase_weight_tx_ = nullptr;
     properties.occupancy_tx_ = nullptr;
+    /* Keep the SSBO double-pointers aimed at the (always-constructed) module
+     * buffers: passes synced in an earlier enabled state can still submit
+     * while volumes are disabled (mr_elephant viewport init), and
+     * ResourceBind::execute dereferences the outer pointer unconditionally —
+     * a null ** is a wasm OOB trap, not a skipped bind. */
+    properties.occupancy_buf_ = &occupancy_buf_;
+    properties.volume_prop_buf_ = &volume_prop_buf_;
     occupancy.occupancy_tx_ = nullptr;
+    occupancy.occupancy_buf_ = &occupancy_buf_;
     occupancy.hit_depth_tx_ = nullptr;
-    occupancy.hit_count_tx_ = nullptr;
+    occupancy.hit_count_buf_ = &hit_count_buf_;
 
     /* Avoid undefined re-projection behavior. */
     valid_history_ = false;
@@ -219,6 +227,13 @@ void VolumeModule::end_sync()
                                      GPU_TEXTURE_USAGE_SHADER_WRITE | GPU_TEXTURE_USAGE_ATOMIC;
   occupancy_tx_.ensure_3d(
       gpu::TextureFormat::UINT_32, int3(data_.tex_size.xy(), occupancy_layers), occupancy_usage);
+  /* SSBO twins for the atomic passes (WGSL has no image atomics). */
+  occupancy_buf_.resize(
+      ceil_to_multiple_u(data_.tex_size.x * data_.tex_size.y * occupancy_layers, 4));
+  hit_count_buf_.resize(ceil_to_multiple_u(data_.tex_size.x * data_.tex_size.y, 4));
+  hit_count_buf_.clear_to_zero();
+  volume_prop_buf_.resize(ceil_to_multiple_u(
+      data_.tex_size.x * data_.tex_size.y * data_.tex_size.z * VOLUME_PROP_BUF_STRIDE, 4));
 
   {
     eGPUTextureUsage hit_count_usage = GPU_TEXTURE_USAGE_SHADER_READ |
@@ -233,9 +248,7 @@ void VolumeModule::end_sync()
     }
     hit_depth_tx_.ensure_3d(
         gpu::TextureFormat::SFLOAT_32, int3(hit_list_size, hit_list_layer), hit_depth_usage);
-    if (hit_count_tx_.ensure_2d(gpu::TextureFormat::UINT_32, hit_list_size, hit_count_usage)) {
-      hit_count_tx_.clear(uint4(0u));
-    }
+    hit_count_tx_.ensure_2d(gpu::TextureFormat::UINT_32, hit_list_size, hit_count_usage);
   }
 
   eGPUTextureUsage front_depth_usage = GPU_TEXTURE_USAGE_SHADER_READ |
@@ -270,9 +283,12 @@ void VolumeModule::end_sync()
   properties.phase_tx_ = prop_phase_tx_;
   properties.phase_weight_tx_ = prop_phase_weight_tx_;
   properties.occupancy_tx_ = occupancy_tx_;
+  properties.occupancy_buf_ = &occupancy_buf_;
+  properties.volume_prop_buf_ = &volume_prop_buf_;
   occupancy.occupancy_tx_ = occupancy_tx_;
+  occupancy.occupancy_buf_ = &occupancy_buf_;
   occupancy.hit_depth_tx_ = hit_depth_tx_;
-  occupancy.hit_count_tx_ = hit_count_tx_;
+  occupancy.hit_count_buf_ = &hit_count_buf_;
 
   /* Set extend mode to extend and reject invalid samples in the shader.
    * This avoids some black rim artifacts near the edge of the re-projected volume.
@@ -444,7 +460,7 @@ void VolumeModule::draw_prepass(View &main_view)
   volume_view.visibility_test(false);
 
   if (!current_objects_.is_empty()) {
-    inst_.pipelines.volume.render(volume_view, occupancy_tx_);
+    inst_.pipelines.volume.render(volume_view, occupancy_buf_);
   }
   GPU_debug_group_end();
 }

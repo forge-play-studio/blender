@@ -47,8 +47,11 @@ struct SurfOccupancy {
   [[legacy_info]] ShaderCreateInfo eevee_geom_iface_info;
 
   [[image(VOLUME_HIT_DEPTH_SLOT, write, SFLOAT_32)]] image3D hit_depth_img;
-  [[image(VOLUME_HIT_COUNT_SLOT, read_write, UINT_32)]] uimage2DAtomic hit_count_img;
-  [[image(VOLUME_OCCUPANCY_SLOT, read_write, UINT_32)]] uimage3DAtomic occupancy_img;
+  /* WGSL has no image atomics (Tint ICE on OpImageTexelPointer): occupancy and
+   * hit counts moved to storage buffers with buffer atomics. Layout matches
+   * the old images — see occupancy_buf_index(). */
+  [[storage(VOLUME_HIT_COUNT_BUF_SLOT, read_write)]] uint (&hit_count_buf)[];
+  [[storage(OCCUPANCY_BUF_SLOT, read_write)]] uint (&occupancy_buf)[];
 
   [[push_constant]] bool use_fast_method;
 };
@@ -74,19 +77,24 @@ void surf_occupancy([[resource_table]] SurfOccupancy &srt,
   if (srt.use_fast_method) {
     occupancy::Bits occupancy_bits = occupancy::bits_from_depth(
         volume_z, uni.uniform_buf.volumes.tex_size.z);
-    for (int i = 0; i < imageSize(srt.occupancy_img).z; i++) {
+    const int2 fb_size = int2(uni.uniform_buf.volumes.tex_size.xy);
+    const int layer_len = (int(uni.uniform_buf.volumes.tex_size.z) + 31) / 32;
+    for (int i = 0; i < layer_len; i++) {
       /* Negate occupancy bits before XORing so that meshes clipped by the near plane fill the
        * space between the inner part of the mesh and the near plane.
        * It doesn't change anything for closed meshes. */
       occupancy_bits.bits[i] = ~occupancy_bits.bits[i];
       if (occupancy_bits.bits[i] != 0u) {
-        imageAtomicXor(srt.occupancy_img, int3(texel, i), occupancy_bits.bits[i]);
+        atomicXor(srt.occupancy_buf[occupancy::occupancy_buf_index(texel, i, fb_size)],
+                  occupancy_bits.bits[i]);
       }
     }
   }
   else {
     if (volume_z > 0.0f) {
-      uint hit_id = imageAtomicAdd(srt.hit_count_img, texel, 1u);
+      const int2 fb_size = int2(uni.uniform_buf.volumes.tex_size.xy);
+      uint hit_id = atomicAdd(srt.hit_count_buf[occupancy::occupancy_buf_index(texel, 0, fb_size)],
+                              1u);
       if (hit_id < VOLUME_HIT_DEPTH_MAX) {
         float value = front_facing ? volume_z : -volume_z;
         imageStore(srt.hit_depth_img, int3(texel, int(hit_id)), float4(value));

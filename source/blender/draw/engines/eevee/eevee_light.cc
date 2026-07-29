@@ -123,6 +123,27 @@ void Light::sync(ShadowModule &shadows,
   }
 
   this->initialized = true;
+
+#ifdef __EMSCRIPTEN__
+  if (getenv("EEVEE_DUMP_LIGHTS")) {
+    fprintf(stderr,
+            "EEVEE_LIGHT type=%d color=(%.4f %.4f %.4f) power[D]=%.5f power[S]=%.5f "
+            "z_axis=(%.3f %.3f %.3f) pos=(%.3f %.3f %.3f) energy=%.3f\n",
+            int(this->type),
+            this->color.x,
+            this->color.y,
+            this->color.z,
+            this->power[LIGHT_DIFFUSE],
+            this->power[LIGHT_SPECULAR],
+            double(object_to_world.z_axis().x),
+            double(object_to_world.z_axis().y),
+            double(object_to_world.z_axis().z),
+            double(object_to_world.location().x),
+            double(object_to_world.location().y),
+            double(object_to_world.location().z),
+            double(la->energy));
+  }
+#endif
 }
 
 float Light::shadow_lod_min_get(const blender::Light *la)

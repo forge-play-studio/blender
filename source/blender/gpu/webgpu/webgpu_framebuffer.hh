@@ -53,8 +53,24 @@ class WebGPUFrameBuffer : public FrameBuffer {
 
  private:
 
+ private:
+  /* True only for the single window backbuffer (context `back_left`). Its
+   * contents are presented to the canvas with a one-shot vertical flip, so —
+   * unlike offscreen targets — its viewport/scissor Y must NOT be re-flipped
+   * again when translated to WebGPU's top-left origin (see apply_viewport_scissor). */
+  bool is_backbuffer_ = false;
+
  public:
   WebGPUFrameBuffer(const char *name) : FrameBuffer(name) {}
+
+  void set_is_backbuffer(bool value)
+  {
+    is_backbuffer_ = value;
+  }
+  bool is_backbuffer() const
+  {
+    return is_backbuffer_;
+  }
 
   void bind(bool enabled_srgb) override;
   bool check(char err_out[256]) override;
