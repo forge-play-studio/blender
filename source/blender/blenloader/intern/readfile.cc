@@ -800,10 +800,34 @@ short blo_bhead_id_flag(const FileData *fd, const BHead *bhead)
 AssetMetaData *blo_bhead_id_asset_data_address(const FileData *fd, const BHead *bhead)
 {
   BLI_assert(blo_bhead_is_id_valid_type(bhead));
-  return (fd->id_asset_data_offset >= 0) ?
-             *reinterpret_cast<AssetMetaData **>(const_cast<BHead *>(
-                 POINTER_OFFSET(bhead, sizeof(*bhead) + fd->id_asset_data_offset))) :
-             nullptr;
+  if (fd->id_asset_data_offset < 0) {
+    return nullptr;
+  }
+  /* The ID's `asset_data` field holds a file-space pointer whose width is the
+   * FILE's pointer size, which may differ from this build's — e.g. a wasm32
+   * build reading a .blend authored on a 64-bit system (the bundled essentials
+   * brush assets). Reading it as a native `AssetMetaData *` truncated the 64-bit
+   * value to its low 32 bits, so the resulting datamap key never matched and the
+   * following BLO_read_struct() produced a null AssetMetaData, which
+   * BKE_asset_metadata_read() then wrote through -> heap corruption / crash
+   * while indexing the asset library. Read at the file width and convert to the
+   * same key convention used for bhead->old / the datamap (uint32_from_uint64_ptr
+   * = value >> 3 for 64->32; zero-extend for 32->64). Endianness switching is not
+   * handled (matches the datamap converters, which assert switch-endian off). */
+  const void *field = POINTER_OFFSET(bhead, sizeof(*bhead) + fd->id_asset_data_offset);
+  const int file_pointer_size = fd->filesdna->pointer_size;
+  uintptr_t old;
+  if (file_pointer_size == 8) {
+    uint64_t v;
+    memcpy(&v, field, sizeof(v));
+    old = (sizeof(void *) == 4) ? uintptr_t(uint32_t(v >> 3)) : uintptr_t(v);
+  }
+  else {
+    uint32_t v;
+    memcpy(&v, field, sizeof(v));
+    old = uintptr_t(v);
+  }
+  return reinterpret_cast<AssetMetaData *>(old);
 }
 
 static const IDHash *blo_bhead_id_deep_hash(const FileData *fd, const BHead *bhead)
