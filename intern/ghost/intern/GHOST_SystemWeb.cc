@@ -21,6 +21,46 @@
 
 #define WEB_CANVAS "#canvas"
 
+/* Cap on how many device pixels we are willing to draw per CSS pixel. The cost
+ * is quadratic and a phone can report 3 or 4; 2 is where it stops being worth
+ * it. */
+#define WEB_MAX_PIXEL_RATIO 2.0
+
+/* Device pixels per CSS pixel for this display. Everything GHOST reports to
+ * Blender is in device pixels, so the framebuffer matches the screen instead of
+ * being drawn at CSS resolution and stretched by the browser. */
+static double web_pixel_ratio()
+{
+  const double ratio = emscripten_get_device_pixel_ratio();
+  if (!(ratio > 0.0)) {
+    return 1.0;
+  }
+  return (ratio > WEB_MAX_PIXEL_RATIO) ? WEB_MAX_PIXEL_RATIO : ratio;
+}
+
+/* Read the canvas CSS box and turn it into a device-pixel size, resizing the
+ * canvas backing store to match. Returns false when the page has not laid the
+ * canvas out yet. */
+static bool web_canvas_device_size(uint32_t *r_width, uint32_t *r_height, double *r_ratio)
+{
+  double css_w = 0.0, css_h = 0.0;
+  if (emscripten_get_element_css_size(WEB_CANVAS, &css_w, &css_h) != EMSCRIPTEN_RESULT_SUCCESS ||
+      css_w <= 0.0 || css_h <= 0.0)
+  {
+    return false;
+  }
+  const double ratio = web_pixel_ratio();
+  const uint32_t width = uint32_t(css_w * ratio + 0.5);
+  const uint32_t height = uint32_t(css_h * ratio + 0.5);
+  /* The backing store is ours to set: the page sizes the element in CSS pixels
+   * and must not also own its resolution. */
+  emscripten_set_canvas_element_size(WEB_CANVAS, int(width), int(height));
+  *r_width = width;
+  *r_height = height;
+  *r_ratio = ratio;
+  return true;
+}
+
 /* --- Static trampolines ----------------------------------------------------- */
 
 static bool web_mouse_cb(int type, const EmscriptenMouseEvent *e, void *user)
@@ -125,11 +165,13 @@ GHOST_TSuccess GHOST_SystemWeb::init()
     return GHOST_kFailure;
   }
 
-  /* Canvas size: authoritative from the page (set once by the harness). */
-  double w = 0, h = 0;
-  if (emscripten_get_element_css_size(WEB_CANVAS, &w, &h) == EMSCRIPTEN_RESULT_SUCCESS && w > 0) {
-    canvas_w_ = uint32_t(w);
-    canvas_h_ = uint32_t(h);
+  /* Canvas size: the page owns the CSS box, we own the resolution. */
+  uint32_t width = 0, height = 0;
+  double ratio = 1.0;
+  if (web_canvas_device_size(&width, &height, &ratio)) {
+    canvas_w_ = width;
+    canvas_h_ = height;
+    pixel_ratio_ = ratio;
   }
 
   /* Input callbacks, delivered on this (the Blender main) thread whenever it
@@ -178,7 +220,7 @@ GHOST_IWindow *GHOST_SystemWeb::createWindow(const char *title,
     return nullptr;
   }
   const GHOST_ContextParams context_params = GHOST_CONTEXT_PARAMS_FROM_GPU_SETTINGS(gpu_settings);
-  window_ = new GHOST_WindowWeb(title, canvas_w_, canvas_h_, state, context_params);
+  window_ = new GHOST_WindowWeb(title, canvas_w_, canvas_h_, state, context_params, pixel_ratio_);
   /* Register with the window manager so validWindow() passes — otherwise every
    * GHOST event is dropped as "invalid window" in wm_window's event handler. */
   window_manager_->addWindow(window_);
@@ -196,8 +238,9 @@ bool GHOST_SystemWeb::handleMouse(int event_type, const EmscriptenMouseEvent *e)
     return false;
   }
   const uint64_t t = getMilliSeconds();
-  cursor_x_ = int32_t(e->targetX);
-  cursor_y_ = int32_t(e->targetY);
+  /* Browser events are in CSS pixels; the window is in device pixels. */
+  cursor_x_ = int32_t(double(e->targetX) * pixel_ratio_);
+  cursor_y_ = int32_t(double(e->targetY) * pixel_ratio_);
 
   modifiers_.set(GHOST_kModifierKeyLeftShift, e->shiftKey);
   modifiers_.set(GHOST_kModifierKeyLeftControl, e->ctrlKey);
@@ -292,14 +335,16 @@ bool GHOST_SystemWeb::handleKey(int event_type, const EmscriptenKeyboardEvent *e
 
 bool GHOST_SystemWeb::handleResize()
 {
-  double w = 0, h = 0;
-  if (emscripten_get_element_css_size(WEB_CANVAS, &w, &h) != EMSCRIPTEN_RESULT_SUCCESS || w <= 0) {
+  uint32_t width = 0, height = 0;
+  double ratio = 1.0;
+  if (!web_canvas_device_size(&width, &height, &ratio)) {
     return false;
   }
-  canvas_w_ = uint32_t(w);
-  canvas_h_ = uint32_t(h);
+  canvas_w_ = width;
+  canvas_h_ = height;
+  pixel_ratio_ = ratio;
   if (window_) {
-    window_->resize(canvas_w_, canvas_h_);
+    window_->resize(canvas_w_, canvas_h_, pixel_ratio_);
     pushEvent(std::unique_ptr<const GHOST_IEvent>(new GHOST_Event(getMilliSeconds(), GHOST_kEventWindowSize, window_)));
   }
   return true;
