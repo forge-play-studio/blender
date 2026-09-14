@@ -51,7 +51,8 @@ jobs:
             gcc-14 g++-14 \
             libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev \
             libxrandr-dev libxinerama-dev libegl-dev libwayland-dev \
-            libdbus-1-dev linux-libc-dev
+            libdbus-1-dev linux-libc-dev \
+            libsm6 libice6 libxext6 libxrender1
           git lfs install
           # Blender 5.3 refuses to configure below GCC 14; the runner's default
           # is 13.3.
@@ -125,6 +126,11 @@ jobs:
         run: |
           BIN=$(find ../install -maxdepth 3 -name blender -type f | head -1)
           echo "binary: $BIN"
+          # The definitive dependency list for whoever has to run this thing.
+          echo "--- shared libraries ---"
+          ldd "$BIN" | sort
+          echo "--- unresolved ---"
+          ldd "$BIN" | grep -i "not found" && { echo "::error::missing shared libraries"; exit 1; } || echo "none"
           "$BIN" --version
           "$BIN" --background --factory-startup --python-expr "import bpy; E={e.identifier for e in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items}; print('BLENDER_FILE_VERSION', bpy.data.version); print('ENGINES', sorted(E)); assert 'CYCLES' in E, 'Cycles missing'; bpy.ops.wm.save_as_mainfile(filepath='/tmp/smoke.blend', check_existing=False, copy=True); print('SMOKE OK')"
           test -s /tmp/smoke.blend
