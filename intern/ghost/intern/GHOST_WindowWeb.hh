@@ -25,22 +25,37 @@ extern "C" void blender_webgpu_backbuffer_size(int width, int height);
 class GHOST_WindowWeb : public GHOST_Window {
  private:
   uint32_t width_, height_;
+  /* Device pixels per CSS pixel. Blender reads this through
+   * getNativePixelSize() and scales the interface by it, the same way it does
+   * for a Retina display, so a HiDPI screen gets a sharp UI at the same
+   * physical size instead of a correct-looking but half-scale one. */
+  float pixel_ratio_ = 1.0f;
 
  public:
   GHOST_WindowWeb(const char * /*title*/,
                   uint32_t width,
                   uint32_t height,
                   GHOST_TWindowState state,
-                  const GHOST_ContextParams &context_params)
-      : GHOST_Window(width, height, state, context_params, false), width_(width), height_(height)
+                  const GHOST_ContextParams &context_params,
+                  double pixel_ratio = 1.0)
+      : GHOST_Window(width, height, state, context_params, false),
+        width_(width),
+        height_(height),
+        pixel_ratio_(float(pixel_ratio))
   {
   }
   ~GHOST_WindowWeb() override = default;
 
-  void resize(uint32_t width, uint32_t height)
+  void resize(uint32_t width, uint32_t height, double pixel_ratio)
   {
     width_ = width;
     height_ = height;
+    pixel_ratio_ = float(pixel_ratio);
+  }
+
+  float getNativePixelSize() override
+  {
+    return (pixel_ratio_ > 0.0f) ? pixel_ratio_ : 1.0f;
   }
 
   GHOST_TSuccess swapBufferAcquire() override
