@@ -132,7 +132,15 @@ jobs:
           echo "--- unresolved ---"
           ldd "$BIN" | grep -i "not found" && { echo "::error::missing shared libraries"; exit 1; } || echo "none"
           "$BIN" --version
-          "$BIN" --background --factory-startup --python-expr "import bpy; E={e.identifier for e in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items}; print('BLENDER_FILE_VERSION', bpy.data.version); print('ENGINES', sorted(E)); assert 'CYCLES' in E, 'Cycles missing'; bpy.ops.wm.save_as_mainfile(filepath='/tmp/smoke.blend', check_existing=False, copy=True); print('SMOKE OK')"
+          # Cycles is NOT in RenderSettings' RNA engine enum -- that enum only
+          # carries the engines compiled into the DNA, and Cycles registers
+          # itself from the `cycles` add-on at runtime. An official build with
+          # Cycles reports exactly ['BLENDER_EEVEE'] there too, so asserting on
+          # it fails on a perfectly good binary. Assign the engine and render
+          # 32x32 instead: that exercises the add-on, the RenderEngine
+          # registration and the kernel in one go.
+          "$BIN" --background --factory-startup --python-expr "import bpy, addon_utils, os; print('CYCLES_ADDON', addon_utils.check('cycles')); bpy.context.scene.render.engine='CYCLES'; assert bpy.context.scene.render.engine=='CYCLES', 'Cycles missing'; bpy.context.scene.cycles.samples=1; bpy.context.scene.render.resolution_x=32; bpy.context.scene.render.resolution_y=32; bpy.context.scene.render.filepath='/tmp/cyc.png'; bpy.ops.render.render(write_still=True); print('CYCLES RENDER BYTES', os.path.getsize('/tmp/cyc.png')); print('BLENDER_FILE_VERSION', bpy.data.version); bpy.ops.wm.save_as_mainfile(filepath='/tmp/smoke.blend', check_existing=False, copy=True); print('SMOKE OK')"
+          test -s /tmp/cyc.png
           test -s /tmp/smoke.blend
 
       - name: Package
