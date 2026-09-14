@@ -28,7 +28,12 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # ubuntu-22.04, NOT ubuntu-latest. The binary has to run on the sandbox
+    # image, which is Debian 12 (glibc 2.36); a 24.04 runner produces one that
+    # needs GLIBC_2.38 and dies with "version `GLIBC_2.38' not found" — glibc is
+    # forward, not backward, compatible. 22.04 is glibc 2.35, comfortably below.
+    # The floor is asserted after the build, so this can never regress silently.
+    runs-on: ubuntu-22.04
     timeout-minutes: 350
     steps:
       # The precompiled library submodule plus the object tree is tens of GB;
@@ -45,6 +50,10 @@ jobs:
 
       - name: Install build prerequisites
         run: |
+          sudo apt-get update
+          # gcc-14 is not in 22.04's own archive; Blender 5.3 requires >= 14
+          # (or clang >= 17, which 22.04 also lacks).
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build git git-lfs python3 \
@@ -129,6 +138,19 @@ jobs:
           ldd "$BIN" | sort
           echo "--- unresolved ---"
           ldd "$BIN" | grep -i "not found" && { echo "::error::missing shared libraries"; exit 1; } || echo "none"
+          # The binary must RUN on the sandbox image (Debian 12 / glibc 2.36).
+          # Assert the floor here: a runner bump that raises the requirement is a
+          # build failure, not a sandbox that cannot start Blender.
+          echo "--- highest GLIBC symbol required ---"
+          MAXGLIBC=$(objdump -T "$BIN" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)
+          echo "$MAXGLIBC (ceiling: GLIBC_2.36)"
+          printf '%s\n' "$MAXGLIBC" "GLIBC_2.36" | sort -VC \
+            || { echo "::error::$MAXGLIBC exceeds the sandbox image's glibc 2.36"; exit 1; }
+          # The X/GL libraries it still needs at runtime. WITH_HEADLESS only drops
+          # GHOST windowing; the GPU module still links libGL. deploy.ts installs
+          # these into the sandbox image -- keep the two lists in step.
+          echo "--- runtime library names (deploy.ts must provide these) ---"
+          objdump -p "$BIN" | awk '/NEEDED/{print $2}' | sort
           "$BIN" --version
           # Cycles is NOT in RenderSettings' RNA engine enum -- that enum only
           # carries the engines compiled into the DNA, and Cycles registers
