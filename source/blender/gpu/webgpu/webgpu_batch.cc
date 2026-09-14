@@ -980,9 +980,27 @@ void WebGPUBatch::record_draw(int vertex_first,
 
   if (ibuf) {
     WebGPUIndexBuf *ibo = static_cast<WebGPUIndexBuf *>(elem_());
-    /* Subrange ibos share the parent's buffer; offset selects the slice. */
+    /* Sub-range ibos (one per material slot) share the parent's buffer and are
+     * selected by an index offset -- but WHERE that offset belongs differs
+     * between the two draw paths, and applying it in both is what made every
+     * material slot after the first disappear:
+     *
+     *   direct    GPU_batch_draw_advanced passes a vertex_first that is
+     *             RELATIVE to the sub-range; the GL backend adds index_start_
+     *             itself (GLIndexBuf::offset_ptr), so the binding carries it.
+     *   indirect  the DrawCommands the draw manager builds already hold an
+     *             ABSOLUTE firstIndex: draw_command.cc fills it from
+     *             GPU_batch_draw_parameter_get, which returns
+     *             index_start_get() (gpu_batch.cc). Offsetting the binding as
+     *             well puts the draw at 2 * index_start_ -- past its own slice,
+     *             so it renders nothing at all.
+     *
+     * Slot 0 has index_start_ == 0 and so survived either way, which is why a
+     * multi-material mesh drew its first material and nothing else. */
+    const uint64_t index_offset = (indirect_buf != nullptr) ? 0 :
+                                                             ibo->wgpu_index_offset_bytes();
     wgpuRenderPassEncoderSetIndexBuffer(
-        pass, ibuf, ibo->wgpu_index_format(), ibo->wgpu_index_offset_bytes(), WGPU_WHOLE_SIZE);
+        pass, ibuf, ibo->wgpu_index_format(), index_offset, WGPU_WHOLE_SIZE);
   }
 
   if (indirect_buf != nullptr) {
