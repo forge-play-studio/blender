@@ -206,8 +206,19 @@ void ED_preview_ensure_dbase(const bool with_gpencil)
 
 bool ED_check_engine_supports_preview(const Scene *scene)
 {
+#ifdef __EMSCRIPTEN__
+  /* Preview renders deadlock the web build. WM jobs run synchronously on the
+   * main thread here (see wm_jobs.cc), and a preview job needs that same main
+   * thread to pump the render it is waiting on, so it never returns: the tab is
+   * wedged for good. Reported as "engine has no preview support" so the UI
+   * takes its own documented fallback (placeholder icon, no retry loop) instead
+   * of hanging. */
+  UNUSED_VARS(scene);
+  return false;
+#else
   RenderEngineType *type = RE_engines_find(scene->r.engine);
   return (type->flag & RE_USE_PREVIEW) != 0;
+#endif
 }
 
 static bool preview_method_is_render(const ePreviewRenderMethod pr_method)
@@ -2151,6 +2162,16 @@ bool ED_preview_id_is_supported(const ID *id, const char **r_disabled_hint)
   if (id == nullptr) {
     return false;
   }
+
+#ifdef __EMSCRIPTEN__
+  /* Same reason as ED_check_engine_supports_preview: the icon preview job
+   * wedges the tab. Refuse before the job is ever queued. */
+  if (r_disabled_hint) {
+    *r_disabled_hint = RPT_("Automatic previews are not available in the web build");
+  }
+  UNUSED_VARS(id);
+  return false;
+#endif
 
   /* Get both the result and the "potential" disabled hint. After that we can decide if the
    * disabled hint needs to be returned to the caller. */
