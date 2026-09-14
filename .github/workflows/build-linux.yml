@@ -54,14 +54,29 @@ jobs:
           git lfs install
 
       # Full clone: make_update drives submodules and needs real git history.
-      # lfs: the startup blend and the datafiles are LFS objects, and CMake
-      # refuses to configure against the pointer stubs
-      # ("Detected incomplete startup blend").
       - name: Checkout Blender (this fork)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: true
+          lfs: false
+
+      # release/datafiles/startup.blend and friends are LFS objects, and CMake
+      # refuses to configure against the pointer stubs ("Detected incomplete
+      # startup blend"). A GitHub fork does NOT carry the upstream's LFS
+      # storage, so checkout's own `lfs: true` fails against this remote.
+      # Blender's tooling solves that with a fallback remote at
+      # projects.blender.org; do the same by hand, since make_update would also
+      # try to move the working tree off this commit.
+      - name: Fetch Git LFS from the Blender fallback remote
+        run: |
+          git lfs install --local
+          git config lfs.remote.searchall true
+          git remote add lfs-fallback https://projects.blender.org/blender/blender.git || true
+          git lfs fetch lfs-fallback
+          git lfs pull
+          SIZE=$(stat -c%s release/datafiles/startup.blend)
+          echo "startup.blend: $SIZE bytes"
+          test "$SIZE" -gt 1024 || { echo "::error::startup.blend is still an LFS pointer"; exit 1; }
 
       # Pulls lib/linux_x64 (the precompiled VFX-platform dependency set).
       # --no-blender: the checkout above already IS the tree we want; letting
