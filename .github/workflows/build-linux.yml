@@ -54,11 +54,14 @@ jobs:
           git lfs install
 
       # Full clone: make_update drives submodules and needs real git history.
+      # lfs: the startup blend and the datafiles are LFS objects, and CMake
+      # refuses to configure against the pointer stubs
+      # ("Detected incomplete startup blend").
       - name: Checkout Blender (this fork)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          lfs: false
+          lfs: true
 
       # Pulls lib/linux_x64 (the precompiled VFX-platform dependency set).
       # --no-blender: the checkout above already IS the tree we want; letting
