@@ -96,20 +96,14 @@ jobs:
 
       # Smoke test in the same shape the sandbox uses it: no window system,
       # a Python expression on the main thread, Cycles present.
+      # Smoke test in the shape the sandbox uses it: no window system, Python on
+      # the main thread, Cycles present, and a .blend actually written.
       - name: Smoke test (headless)
         run: |
           BIN=$(find ../install -maxdepth 3 -name blender -type f | head -1)
           echo "binary: $BIN"
           "$BIN" --version
-          "$BIN" --background --factory-startup --python-expr '
-import bpy, sys
-print("SUBVERSION", bpy.data.version)
-engines = {e.identifier for e in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items}
-print("ENGINES", sorted(engines))
-assert "CYCLES" in engines, "Cycles missing"
-bpy.ops.wm.save_as_mainfile(filepath="/tmp/smoke.blend", check_existing=False, copy=True)
-print("SAVED OK")
-' 2>&1 | tail -20
+          "$BIN" --background --factory-startup --python-expr "import bpy; E={e.identifier for e in bpy.types.RenderSettings.bl_rna.properties['engine'].enum_items}; print('BLENDER_FILE_VERSION', bpy.data.version); print('ENGINES', sorted(E)); assert 'CYCLES' in E, 'Cycles missing'; bpy.ops.wm.save_as_mainfile(filepath='/tmp/smoke.blend', check_existing=False, copy=True); print('SMOKE OK')"
           test -s /tmp/smoke.blend
 
       - name: Package
