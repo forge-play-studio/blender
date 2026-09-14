@@ -48,10 +48,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build git git-lfs python3 \
+            gcc-14 g++-14 \
             libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev \
             libxrandr-dev libxinerama-dev libegl-dev libwayland-dev \
             libdbus-1-dev linux-libc-dev
           git lfs install
+          # Blender 5.3 refuses to configure below GCC 14; the runner's default
+          # is 13.3.
+          gcc-14 --version | head -1
 
       # Full clone: make_update drives submodules and needs real git history.
       - name: Checkout Blender (this fork)
@@ -89,6 +93,7 @@ jobs:
 
       - name: Configure (headless + Cycles)
         run: |
+          export CC=gcc-14 CXX=g++-14
           cmake -S . -B ../build -G Ninja \
             -C build_files/cmake/config/blender_headless.cmake \
             -DCMAKE_BUILD_TYPE=Release \
