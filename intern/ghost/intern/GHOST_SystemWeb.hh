@@ -24,6 +24,9 @@ class GHOST_SystemWeb : public GHOST_System {
   GHOST_Buttons buttons_;
   GHOST_ModifierKeys modifiers_;
   uint32_t canvas_w_ = 1280, canvas_h_ = 720;
+  /* Device pixels per CSS pixel. canvas_w_/h_ are in device pixels; browser
+   * event coordinates are not, and have to be scaled by this. */
+  double pixel_ratio_ = 1.0;
 
  public:
   GHOST_SystemWeb();
