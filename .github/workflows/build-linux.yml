@@ -1,4 +1,4 @@
-name: build-linux-headless
+name: headless
 
 # Native Linux build of THIS commit, headless + Cycles, for the fps-agent
 # sandbox's resident Blender.
@@ -118,8 +118,6 @@ jobs:
           ninja -C ../build -j $(nproc) install
           df -h /
 
-      # Smoke test in the same shape the sandbox uses it: no window system,
-      # a Python expression on the main thread, Cycles present.
       # Smoke test in the shape the sandbox uses it: no window system, Python on
       # the main thread, Cycles present, and a .blend actually written.
       - name: Smoke test (headless)
@@ -149,22 +147,22 @@ jobs:
           SHORT=$(git rev-parse --short HEAD)
           ROOT=$(find ../install -maxdepth 2 -name blender -type f -printf '%h\n' | head -1)
           echo "packaging from: $ROOT"
-          tar -C "$ROOT" -cJf "blender-linux-headless-${SHORT}.tar.xz" .
-          ls -la blender-linux-headless-*.tar.xz
+          tar -C "$ROOT" -cJf "headless-${SHORT}.tar.xz" .
+          ls -la headless-*.tar.xz
           echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: blender-linux-headless-${{ steps.pkg.outputs.short }}
-          path: blender-linux-headless-*.tar.xz
+          name: headless-${{ steps.pkg.outputs.short }}
+          path: headless-*.tar.xz
           if-no-files-found: error
 
       # Rolling release so the sandbox template can fetch a stable URL.
       - name: Publish rolling release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: linux-headless-latest
+          tag_name: headless-latest
           name: Linux headless (rolling)
           prerelease: true
-          files: blender-linux-headless-*.tar.xz
+          files: headless-*.tar.xz
