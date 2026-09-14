@@ -1,0 +1,139 @@
+name: build-linux-headless
+
+# Native Linux build of THIS commit, headless + Cycles, for the fps-agent
+# sandbox's resident Blender.
+#
+# Why this exists: the browser runs this same tree compiled to wasm
+# (forge-play-studio/blender-wasm). Scene sync between the two is done by
+# exchanging .blend FILES, which is only sound when both sides share one DNA
+# subversion — an official daily build is 17 subversions ahead of our base and
+# would silently drop data. So the resident is built from the exact commit the
+# wasm build uses.
+#
+# Headless (no GHOST/X11) because the sandbox image has no X libraries and the
+# resident only ever runs `blender --background`. Cycles stays ON: full-size
+# renders are the agent's feedback signal.
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ['linux-v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      # The precompiled library submodule plus the object tree is tens of GB;
+      # a stock runner has ~14 GB free.
+      - name: Free up disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Install build prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git git-lfs python3 \
+            libx11-dev libxxf86vm-dev libxcursor-dev libxi-dev \
+            libxrandr-dev libxinerama-dev libegl-dev libwayland-dev \
+            libdbus-1-dev linux-libc-dev
+          git lfs install
+
+      # Full clone: make_update drives submodules and needs real git history.
+      - name: Checkout Blender (this fork)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+
+      # Pulls lib/linux_x64 (the precompiled VFX-platform dependency set).
+      # --no-blender: the checkout above already IS the tree we want; letting
+      # make_update pull would move us off this commit.
+      - name: Fetch precompiled libraries
+        run: |
+          ./build_files/utils/make_update.py --no-blender
+          du -sh lib/linux_x64 || true
+          df -h /
+
+      - name: Configure (headless + Cycles)
+        run: |
+          cmake -S . -B ../build -G Ninja \
+            -C build_files/cmake/config/blender_headless.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DWITH_CYCLES=ON \
+            -DWITH_CYCLES_EMBREE=ON \
+            -DWITH_CYCLES_OSL=OFF \
+            -DWITH_CYCLES_DEVICE_CUDA=OFF \
+            -DWITH_CYCLES_DEVICE_OPTIX=OFF \
+            -DWITH_CYCLES_DEVICE_HIP=OFF \
+            -DWITH_CYCLES_DEVICE_ONEAPI=OFF \
+            -DWITH_OPENIMAGEDENOISE=ON \
+            -DWITH_PYTHON=ON \
+            -DWITH_PYTHON_INSTALL=ON \
+            -DWITH_INSTALL_PORTABLE=ON \
+            -DWITH_INTERNATIONAL=OFF \
+            -DWITH_DRACO=OFF \
+            -DCMAKE_INSTALL_PREFIX=$PWD/../install
+
+      - name: Build + install
+        run: |
+          ninja -C ../build -j $(nproc) install
+          df -h /
+
+      # Smoke test in the same shape the sandbox uses it: no window system,
+      # a Python expression on the main thread, Cycles present.
+      - name: Smoke test (headless)
+        run: |
+          BIN=$(find ../install -maxdepth 3 -name blender -type f | head -1)
+          echo "binary: $BIN"
+          "$BIN" --version
+          "$BIN" --background --factory-startup --python-expr '
+import bpy, sys
+print("SUBVERSION", bpy.data.version)
+engines = {e.identifier for e in bpy.types.RenderSettings.bl_rna.properties["engine"].enum_items}
+print("ENGINES", sorted(engines))
+assert "CYCLES" in engines, "Cycles missing"
+bpy.ops.wm.save_as_mainfile(filepath="/tmp/smoke.blend", check_existing=False, copy=True)
+print("SAVED OK")
+' 2>&1 | tail -20
+          test -s /tmp/smoke.blend
+
+      - name: Package
+        id: pkg
+        run: |
+          SHORT=$(git rev-parse --short HEAD)
+          ROOT=$(find ../install -maxdepth 2 -name blender -type f -printf '%h\n' | head -1)
+          echo "packaging from: $ROOT"
+          tar -C "$ROOT" -cJf "blender-linux-headless-${SHORT}.tar.xz" .
+          ls -la blender-linux-headless-*.tar.xz
+          echo "short=${SHORT}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blender-linux-headless-${{ steps.pkg.outputs.short }}
+          path: blender-linux-headless-*.tar.xz
+          if-no-files-found: error
+
+      # Rolling release so the sandbox template can fetch a stable URL.
+      - name: Publish rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: linux-headless-latest
+          name: Linux headless (rolling)
+          prerelease: true
+          files: blender-linux-headless-*.tar.xz
