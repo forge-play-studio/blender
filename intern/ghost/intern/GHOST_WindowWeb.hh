@@ -25,10 +25,9 @@ extern "C" void blender_webgpu_backbuffer_size(int width, int height);
 class GHOST_WindowWeb : public GHOST_Window {
  private:
   uint32_t width_, height_;
-  /* Device pixels per CSS pixel. Blender reads this through
-   * getNativePixelSize() and scales the interface by it, the same way it does
-   * for a Retina display, so a HiDPI screen gets a sharp UI at the same
-   * physical size instead of a correct-looking but half-scale one. */
+  /* Device pixels per CSS pixel. Kept for the record and for anyone sizing
+   * against the window; deliberately NOT reported through getNativePixelSize()
+   * -- see below. */
   float pixel_ratio_ = 1.0f;
 
  public:
@@ -53,9 +52,30 @@ class GHOST_WindowWeb : public GHOST_Window {
     pixel_ratio_ = float(pixel_ratio);
   }
 
+  /* 1.0, NOT the device pixel ratio.
+   *
+   * Reporting the ratio here is what Retina does on macOS and it did give a
+   * correctly-sized interface -- but on this backend it also blanked whole
+   * editor regions: measured on a 2x display, the outliner and the properties
+   * editor drew nothing at all while the 3D viewport, the toolbars and the
+   * timeline were fine. At ratio 1 every region drew correctly, same build,
+   * same scene, and that ratio was the only variable.
+   *
+   * Sharpness does not depend on this. The window is still sized and reported
+   * in DEVICE pixels (GHOST_SystemWeb multiplies the CSS box by the ratio and
+   * sizes the canvas backing store to match), so Blender still renders at the
+   * display's real resolution. What this value would have bought is the
+   * automatic interface scale-up, and the page already owns that: the panel
+   * passes its factor in the URL and the bridge sets `ui_scale` right after
+   * boot (packages/blender: wasm-bridge.js / bridge.py `op:'ui_scale'`).
+   * One scale knob, driven by the side that actually knows the ratio.
+   *
+   * The cost of this trade is that a page which boots the runtime WITHOUT
+   * setting ui_scale gets a sharp but half-size interface. That is a visibly
+   * small UI; the alternative was an invisible one. */
   float getNativePixelSize() override
   {
-    return (pixel_ratio_ > 0.0f) ? pixel_ratio_ : 1.0f;
+    return 1.0f;
   }
 
   GHOST_TSuccess swapBufferAcquire() override
