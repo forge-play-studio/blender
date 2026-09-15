@@ -535,11 +535,37 @@ void WM_jobs_start(wmWindowManager *wm, wmJob *wm_job)
          * GPU call. Blocking the tab for the job's duration is the acceptable
          * trade-off. The ready flag hands completion to the normal timer
          * machinery (wm_jobs_timer → wm_job_end). */
-        fprintf(stderr, "WM_JOB sync start '%s'\n", wm_job->name);
-        fflush(stderr);
-        do_job_thread(wm_job);
-        fprintf(stderr, "WM_JOB sync done '%s'\n", wm_job->name);
-        fflush(stderr);
+        /* ...with ONE exception. WM_JOB_TYPE_RENDER_PREVIEW (the material /
+         * world preview sphere the properties editor draws) renders offscreen
+         * and then wants a SYNCHRONOUS GPU->CPU readback, which needs Asyncify
+         * or JSPI and this build has neither: emdawnwebgpu reports
+         * "timedWaitAnyEnable requested, but requires Asyncify or JSPI" and the
+         * map fails. Measured on the shipped runtime, opening Material in the
+         * properties editor with two materials: a 13s freeze of the whole tab,
+         * and on one run it never returned at all -- main thread dead, no
+         * further output. That is not "blocking for the job's duration", it is
+         * losing the session for a 32px icon.
+         * Ending it as if the user had cancelled is a path Blender already
+         * supports, so endjob still runs and run_customdata is still freed by
+         * the normal wm_jobs_timer -> wm_job_end route. The icon just stays a
+         * placeholder.
+         * Deliberately narrow: WM_JOB_TYPE_LOAD_PREVIEW reads the OS thumbnail
+         * cache and touches no GPU, and WM_JOB_TYPE_STUDIOLIGHT has the same
+         * shape but is not what anyone has hit -- widen this only with a
+         * measurement, not a hunch. */
+        if (wm_job->job_type == WM_JOB_TYPE_RENDER_PREVIEW) {
+          fprintf(stderr, "WM_JOB skip '%s' (UI preview needs a sync GPU readback)\n", wm_job->name);
+          fflush(stderr);
+          wm_job->worker_status.stop = true;
+          wm_job->ready = true;
+        }
+        else {
+          fprintf(stderr, "WM_JOB sync start '%s'\n", wm_job->name);
+          fflush(stderr);
+          do_job_thread(wm_job);
+          fprintf(stderr, "WM_JOB sync done '%s'\n", wm_job->name);
+          fflush(stderr);
+        }
 #else
         BLI_threadpool_init(&wm_job->threads, do_job_thread, 1);
         BLI_threadpool_insert(&wm_job->threads, wm_job);
